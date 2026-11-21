@@ -1,0 +1,2 @@
+# IMTalker_Personaplex_emotion_v1_auto_emotion_from_helium_v2
+Try adding emotion prediction from helium to the IMTalker_PersonaPlex_emotion_v1_auto_emotion planning using opus
