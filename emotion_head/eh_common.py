@@ -721,9 +721,24 @@ class ShardWriter:
 
 
 def iter_shard_records(feat_dir, prefix):
-    for path in sorted(Path(feat_dir).glob(f"{prefix}_shard_*.pt")):
+    """Yields records from `{prefix}_shard_*.pt` AND per-GPU worker shards
+    (`{prefix}_g0_shard_*.pt`, ...), so multi-GPU output is transparent."""
+    for path in sorted(Path(feat_dir).glob(f"{prefix}*_shard_*.pt")):
         for rec in torch.load(path, map_location="cpu", weights_only=False):
             yield rec
+
+
+def completed_clip_ids(feat_dir, prefix) -> set:
+    """Union of `completed` clip ids across all `{prefix}*_index.json` files
+    (single-GPU writer + every per-GPU worker). Lets a worker skip clips that
+    siblings already finished (e.g. when resuming with a different GPU count)."""
+    done = set()
+    for idx in Path(feat_dir).glob(f"{prefix}*_index.json"):
+        try:
+            done.update(json.loads(idx.read_text()).get("completed", []))
+        except Exception:
+            pass
+    return done
 
 
 def read_channel(path, channel: int, sr: int = SAMPLE_RATE) -> np.ndarray:
@@ -835,4 +850,240 @@ def train_head(model, train_loader, val_loader, *, device="cuda", epochs=12,
     if best_state is not None:
         model.load_state_dict(best_state)
     return best_f1, history
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU workers (one spawned process per GPU, one model instance each).
+# Jobs are partitioned round-robin (jobs[gpu_id::n_gpus]); each worker writes
+# its own shard prefix (e.g. phaseA_g2) + log file, so resume is per-worker and
+# iter_shard_records picks every worker's shards up transparently.
+# ---------------------------------------------------------------------------
+def _load_stack_on(root, device, bf16_model_st=None):
+    """Load sp + mimi + LM + LMGen(hidden step) on `device` inside a worker."""
+    P = get_paths(root)
+    ensure_moshi_importable(P)
+    sp = load_sp(P)
+    mimi = load_mimi(P, device)
+    if bf16_model_st is None:
+        lm = load_lm_bnb4(P, device, torch.bfloat16)
+    else:
+        lm = load_lm_bf16(bf16_model_st, device, torch.bfloat16)
+    lm_gen = make_lm_gen(lm, device)
+    install_hidden_step(lm_gen)
+    return P, sp, mimi, lm_gen
+
+
+def _prompt_state_for(lm_gen, mimi, sp, P, use_prompt: bool):
+    if use_prompt:
+        return apply_prompts_and_snapshot(
+            lm_gen, mimi, sp, str(P.VOICE_PT),
+            P.TEXT_PROMPT_FILE.read_text(encoding="utf-8", errors="replace"))
+    return snapshot_streaming_state(lm_gen)
+
+
+def _phaseA_worker(gpu_id, n_gpus, root, jobs, cfg):
+    device = f"cuda:{gpu_id}"
+    P, sp, mimi, lm_gen = _load_stack_on(root, device)
+    prompt_state = _prompt_state_for(lm_gen, mimi, sp, P, cfg.get("use_prompt", True))
+    writer = ShardWriter(P.FEAT_A, f"phaseA_g{gpu_id}", cfg.get("clips_per_shard", 256))
+    log = ProgressLogger(P.FEAT_A / f"extract_phaseA_g{gpu_id}.log", echo_every=10)
+    done_all = completed_clip_ids(P.FEAT_A, "phaseA")
+    todo = [r for r in jobs[gpu_id::n_gpus] if r["clip_id"] not in done_all]
+    total = len(done_all & {r["clip_id"] for r in jobs[gpu_id::n_gpus]}) + len(todo)
+    log.log(f"=== gpu{gpu_id} phaseA START | completed={total - len(todo)} "
+            f"todo={len(todo)} | device={device} use_prompt={cfg.get('use_prompt', True)}",
+            force=True)
+    t0 = time.time()
+    failed, times = 0, []
+    for row in todo:
+        ct0 = time.time()
+        try:
+            agent = read_channel(row["wav_path"], 0)
+            user = read_channel(row["wav_path"], 1)
+            n_frames = max(len(agent), len(user)) // FRAME_SAMPLES + 1
+            stream = build_agent_text_stream(row["agent_words"], n_frames, sp)
+            restore_streaming_state(lm_gen, mimi, prompt_state)
+            feats = extract_clip_features(lm_gen, mimi, agent, user, stream, device)
+            T = feats["hidden"].shape[0]
+            mask = np.zeros(T, dtype=bool)
+            for s, e in row["agent_turn_frames"]:
+                mask[max(0, s):min(T, e)] = True
+            ue = row.get("user_emotion")
+            writer.add({
+                "clip_id": row["clip_id"], **feats,
+                "agent_mask": torch.from_numpy(mask),
+                "label": EMO2ID[row["emotion"]],
+                "user_emotion": EMO2ID.get(str(ue).lower(), -1) if ue else -1,
+                "user_id": row["user_id"], "split": row["split"],
+                "text_stream": torch.from_numpy(stream).to(torch.int32),
+            })
+        except Exception as e:
+            failed += 1
+            log.log(f"ERROR clip={row['clip_id']} ({row['emotion']}): "
+                    f"{type(e).__name__}: {e} | skipped (resume-safe)", force=True)
+            continue
+        dt = time.time() - ct0
+        times.append(dt)
+        done_n = total - len(todo) + len(times)
+        remaining = max(0, total - done_n)
+        avg = sum(times) / len(times)
+        log.log(f"[gpu{gpu_id}] clip {done_n}/{total} | +{dt:.2f}s avg={avg:.2f}s "
+                f"| left={remaining} ETA={avg * remaining / 3600:.2f}h "
+                f"| failed={failed} | {row['clip_id']} ({row['emotion']})")
+    writer.close()
+    log.log(f"=== gpu{gpu_id} phaseA END | failed={failed} "
+            f"| elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
+
+
+def phaseA_extract_multi(jobs, root, n_gpus, cfg):
+    """Spawn one Phase-A extraction worker per GPU. `jobs`: list of small dicts
+    (clip_id, wav_path, emotion, user_id, split, user_emotion,
+    agent_turn_frames, agent_words). Blocks until all workers finish."""
+    import torch.multiprocessing as tmp
+    tmp.spawn(_phaseA_worker, args=(n_gpus, root, jobs, cfg), nprocs=n_gpus, join=True)
+
+
+def _gen_worker(gpu_id, n_gpus, root, samples, cfg):
+    device = f"cuda:{gpu_id}"
+    P, sp, mimi, lm_gen = _load_stack_on(root, device, bf16_model_st=cfg["model_st"])
+    base_state = snapshot_streaming_state(lm_gen)
+    prompt_states = {}
+    for e in EMOTIONS:
+        restore_streaming_state(lm_gen, mimi, base_state)
+        prompt_states[e] = apply_prompts_and_snapshot(
+            lm_gen, mimi, sp, str(P.VOICE_PT), f"Answer with a {e} tone.")
+    writer = ShardWriter(P.GEN, f"gen_g{gpu_id}", cfg.get("clips_per_shard", 128))
+    log = ProgressLogger(P.GEN / f"generate_g{gpu_id}.log", echo_every=10)
+    done_all = completed_clip_ids(P.GEN, "gen")
+    todo = [s for s in samples[gpu_id::n_gpus] if s["sample_id"] not in done_all]
+    total = len(done_all & {s["sample_id"] for s in samples[gpu_id::n_gpus]}) + len(todo)
+    log.log(f"=== gpu{gpu_id} generation START | completed={total - len(todo)} "
+            f"todo={len(todo)} | device={device}", force=True)
+    t0 = time.time()
+    failed, times = 0, []
+    qa_fail = {"too_short": 0, "speak_fraction": 0}
+    min_frames = int(cfg.get("min_reply_s", 0.5) * FRAME_HZ)
+    for s in todo:
+        ct0 = time.time()
+        try:
+            user = read_channel(s["wav_path"], 1)      # right channel = user
+            restore_streaming_state(lm_gen, mimi, prompt_states[s["emotion"]])
+            out = generate_reply(lm_gen, mimi, user,
+                                 max_reply_s=cfg.get("max_reply_s", 18.0),
+                                 min_reply_s=cfg.get("min_reply_s", 0.5),
+                                 stop_silence_s=cfg.get("stop_silence_s", 2.0),
+                                 device=device)
+            T = out["codes"].shape[0]
+            reply_frames = T - out["n_user_frames"]
+            speak = (float((out["rms"][out["n_user_frames"]:] > 0.006).mean())
+                     if reply_frames > 0 else 0.0)
+            if reply_frames < min_frames:
+                qa_fail["too_short"] += 1
+                continue
+            if not (0.05 <= speak <= 0.97):
+                qa_fail["speak_fraction"] += 1
+                continue
+            writer.add(dict(
+                clip_id=s["sample_id"], src_clip=s["clip_id"], user_id=s["user_id"],
+                emotion=s["emotion"], label=EMO2ID[s["emotion"]],
+                codes=out["codes"],
+                text_tokens=torch.from_numpy(out["text_tokens"]).to(torch.int32),
+                pcm=torch.from_numpy(out["pcm"]).to(torch.float16),
+                rms=torch.from_numpy(out["rms"]).to(torch.float16),
+                n_user_frames=out["n_user_frames"], user_codes=out["user_codes"]))
+        except Exception as e:
+            failed += 1
+            log.log(f"ERROR sample={s['sample_id']} ({s['emotion']}): "
+                    f"{type(e).__name__}: {e} | skipped (resume-safe)", force=True)
+            continue
+        dt = time.time() - ct0
+        times.append(dt)
+        done_n = total - len(todo) + len(times)
+        remaining = max(0, total - done_n)
+        avg = sum(times) / len(times)
+        log.log(f"[gpu{gpu_id}] sample {done_n}/{total} | +{dt:.1f}s avg={avg:.1f}s "
+                f"| left={remaining} ETA={avg * remaining / 3600:.2f}h "
+                f"| qa_rej={sum(qa_fail.values())} failed={failed} "
+                f"| {s['sample_id']} ({s['emotion']})")
+    writer.close()
+    log.log(f"=== gpu{gpu_id} generation END | QA rejected={qa_fail} failed={failed} "
+            f"| elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
+
+
+def generate_multi(samples, root, n_gpus, cfg):
+    """Spawn one in-domain generation worker per GPU (emotionplex-7b bf16 on
+    each). cfg: model_st, max_reply_s, min_reply_s, stop_silence_s,
+    clips_per_shard. Blocks until all workers finish."""
+    import torch.multiprocessing as tmp
+    tmp.spawn(_gen_worker, args=(n_gpus, root, samples, cfg), nprocs=n_gpus, join=True)
+
+
+def _phaseB_worker(gpu_id, n_gpus, root, cfg):
+    device = f"cuda:{gpu_id}"
+    P, sp, mimi, lm_gen = _load_stack_on(root, device)
+    prompt_state = _prompt_state_for(lm_gen, mimi, sp, P, True)
+    import pandas as pd
+    man = pd.read_parquet(P.DATA / "manifest.parquet")
+    user_of = dict(zip(man.clip_id, man.user_id))
+    holdout_users = set(man.loc[man.split == "holdout", "user_id"].unique())
+    gen_recs = list(iter_shard_records(P.GEN, "gen"))
+    n_test = max(1, len(gen_recs) // 10)
+    test_ids = set(r["clip_id"] for r in gen_recs[-n_test:])
+    writer = ShardWriter(P.FEAT_B, f"phaseB_g{gpu_id}", cfg.get("clips_per_shard", 128))
+    log = ProgressLogger(P.FEAT_B / f"extract_phaseB_g{gpu_id}.log", echo_every=10)
+    done_all = completed_clip_ids(P.FEAT_B, "phaseB")
+    todo = [r for r in gen_recs[gpu_id::n_gpus] if r["clip_id"] not in done_all]
+    total = len(done_all & {r["clip_id"] for r in gen_recs[gpu_id::n_gpus]}) + len(todo)
+    log.log(f"=== gpu{gpu_id} phaseB START | completed={total - len(todo)} "
+            f"todo={len(todo)} | device={device}", force=True)
+    t0 = time.time()
+    failed, times = 0, []
+    for r in todo:
+        ct0 = time.time()
+        try:
+            restore_streaming_state(lm_gen, mimi, prompt_state)
+            feats = extract_from_codes(lm_gen, mimi, r["user_codes"].long(),
+                                       r["codes"].long(),
+                                       r["text_tokens"].long().numpy(), device)
+            T = feats["hidden"].shape[0]
+            rms = r["rms"].float().numpy()
+            mask = np.zeros(T, dtype=bool)
+            for t in range(int(r["n_user_frames"]), T):
+                mask[t] = rms[t] > 0.006
+            uid = r.get("user_id") or user_of.get(r["src_clip"], "")
+            if uid in holdout_users:
+                split = "holdout"
+            elif r["clip_id"] in test_ids:
+                split = "test_indomain"
+            else:
+                split = "train"
+            feats["pros"] = torch.from_numpy(prosody_features(r["pcm"].float().numpy()))
+            writer.add(dict(clip_id=r["clip_id"], **feats,
+                            agent_mask=torch.from_numpy(mask), label=int(r["label"]),
+                            user_emotion=-1, user_id=uid, split=split,
+                            text_stream=r["text_tokens"]))
+        except Exception as e:
+            failed += 1
+            log.log(f"ERROR sample={r['clip_id']}: {type(e).__name__}: {e} "
+                    f"| skipped (resume-safe)", force=True)
+            continue
+        dt = time.time() - ct0
+        times.append(dt)
+        done_n = total - len(todo) + len(times)
+        remaining = max(0, total - done_n)
+        avg = sum(times) / len(times)
+        log.log(f"[gpu{gpu_id}] sample {done_n}/{total} | +{dt:.2f}s avg={avg:.2f}s "
+                f"| left={remaining} ETA={avg * remaining / 3600:.2f}h "
+                f"| failed={failed} | {r['clip_id']}")
+    writer.close()
+    log.log(f"=== gpu{gpu_id} phaseB END | failed={failed} "
+            f"| elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
+
+
+def phaseB_extract_multi(root, n_gpus, cfg):
+    """Spawn one Phase-B extraction worker per GPU. Each worker reloads the gen
+    shards + manifest (deterministic split assignment) and partitions
+    round-robin. Blocks until all workers finish."""
+    import torch.multiprocessing as tmp
+    tmp.spawn(_phaseB_worker, args=(n_gpus, root, cfg), nprocs=n_gpus, join=True)
 

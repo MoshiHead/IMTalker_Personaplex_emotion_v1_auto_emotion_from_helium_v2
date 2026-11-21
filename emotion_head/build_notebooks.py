@@ -561,55 +561,74 @@ print("PARITY OK")
 NB02 += [
 code(r'''
 from tqdm.auto import tqdm
-log = eh.ProgressLogger(P.FEAT_A / "extract_phaseA.log", echo_every=25)
-writer = eh.ShardWriter(P.FEAT_A, "phaseA", CLIPS_PER_SHARD)
-todo = [r for r in sel.to_dict("records") if r["clip_id"] not in writer.completed]
-total_target = len(writer.completed) + len(todo)
-log.log(f"=== phaseA extraction START | completed={len(writer.completed)} "
-        f"todo={len(todo)} target={total_target} | device={DEVICE} "
-        f"live_prompt={USE_LIVE_PROMPT_PREFIX}", force=True)
-t0 = time.time()
-failed, times = 0, []
-for row in tqdm(todo, total=len(todo)):
-    ct0 = time.time()
-    try:
-        agent = eh.read_channel(row["wav_path"], 0)
-        user = eh.read_channel(row["wav_path"], 1)
-        n_frames = max(len(agent), len(user)) // eh.FRAME_SAMPLES + 1
-        stream = eh.build_agent_text_stream([w for w in row["alignments"] if agent_side(w)], n_frames, sp)
-        eh.restore_streaming_state(lm_gen, mimi, prompt_state)
-        feats = eh.extract_clip_features(lm_gen, mimi, agent, user, stream, DEVICE)
-        T = feats["hidden"].shape[0]
-        mask = np.zeros(T, dtype=bool)
-        for s, e in row["agent_turn_frames"]:
-            mask[max(0, s):min(T, e)] = True
-        ue = row.get("user_emotion")
-        writer.add({
-            "clip_id": row["clip_id"], **feats,
-            "agent_mask": torch.from_numpy(mask),
-            "label": eh.EMO2ID[row["emotion"]],
-            "user_emotion": eh.EMO2ID.get(str(ue).lower(), -1) if ue else -1,
-            "user_id": row["user_id"], "split": row["split"],
-            "text_stream": torch.from_numpy(stream).to(torch.int32),
-        })
-    except Exception as e:
-        failed += 1
-        log.log(f"ERROR clip={row['clip_id']} ({row['emotion']}): "
-                f"{type(e).__name__}: {e} | skipped (resume-safe)", force=True)
-        continue
-    dt = time.time() - ct0
-    times.append(dt)
-    completed = len(writer.completed)
-    remaining = max(0, total_target - completed)
-    avg = sum(times) / len(times)
-    log.log(f"clip {completed}/{total_target} | +{dt:.2f}s avg={avg:.2f}s "
-            f"| left={remaining} ETA={avg * remaining / 3600:.2f}h "
-            f"| failed={failed} | {row['clip_id']} ({row['emotion']})")
-writer.close()
-log.log(f"=== phaseA extraction END | completed={len(writer.completed)}/{total_target} "
-        f"failed={failed} | elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
-print("done. total completed:", len(writer.completed), "| failed:", failed,
-      "| log:", log.path)
+N_GPUS = torch.cuda.device_count()
+jobs = [dict(clip_id=r["clip_id"], wav_path=r["wav_path"], emotion=r["emotion"],
+             user_id=r["user_id"], split=r["split"], user_emotion=r.get("user_emotion"),
+             agent_turn_frames=r["agent_turn_frames"],
+             agent_words=[w for w in r["alignments"] if agent_side(w)])
+        for r in sel.to_dict("records")]
+if N_GPUS > 1:
+    # one spawned worker per GPU, each with its own model instance, shard prefix
+    # (phaseA_g<i>) and log (extract_phaseA_g<i>.log). Resume: re-run this cell.
+    print(f"multi-GPU: {N_GPUS} GPUs -> {N_GPUS} extraction workers (round-robin)")
+    for _n in ("lm", "lm_gen", "mimi"):
+        globals().pop(_n, None)     # free the in-kernel model so GPU0 has room
+    eh.free_gpu()
+    eh.phaseA_extract_multi(jobs, str(P.ROOT), N_GPUS,
+                            dict(use_prompt=USE_LIVE_PROMPT_PREFIX,
+                                 clips_per_shard=CLIPS_PER_SHARD))
+    print("all workers done | shards:", len(list(P.FEAT_A.glob("phaseA*_shard_*.pt"))),
+          "| logs:", sorted(p.name for p in P.FEAT_A.glob("extract_phaseA*.log")))
+else:
+    log = eh.ProgressLogger(P.FEAT_A / "extract_phaseA.log", echo_every=25)
+    writer = eh.ShardWriter(P.FEAT_A, "phaseA", CLIPS_PER_SHARD)
+    todo = [r for r in jobs if r["clip_id"] not in writer.completed]
+    total_target = len(writer.completed) + len(todo)
+    log.log(f"=== phaseA extraction START | completed={len(writer.completed)} "
+            f"todo={len(todo)} target={total_target} | device={DEVICE} "
+            f"live_prompt={USE_LIVE_PROMPT_PREFIX}", force=True)
+    t0 = time.time()
+    failed, times = 0, []
+    for row in tqdm(todo, total=len(todo)):
+        ct0 = time.time()
+        try:
+            agent = eh.read_channel(row["wav_path"], 0)
+            user = eh.read_channel(row["wav_path"], 1)
+            n_frames = max(len(agent), len(user)) // eh.FRAME_SAMPLES + 1
+            stream = eh.build_agent_text_stream(row["agent_words"], n_frames, sp)
+            eh.restore_streaming_state(lm_gen, mimi, prompt_state)
+            feats = eh.extract_clip_features(lm_gen, mimi, agent, user, stream, DEVICE)
+            T = feats["hidden"].shape[0]
+            mask = np.zeros(T, dtype=bool)
+            for s, e in row["agent_turn_frames"]:
+                mask[max(0, s):min(T, e)] = True
+            ue = row.get("user_emotion")
+            writer.add({
+                "clip_id": row["clip_id"], **feats,
+                "agent_mask": torch.from_numpy(mask),
+                "label": eh.EMO2ID[row["emotion"]],
+                "user_emotion": eh.EMO2ID.get(str(ue).lower(), -1) if ue else -1,
+                "user_id": row["user_id"], "split": row["split"],
+                "text_stream": torch.from_numpy(stream).to(torch.int32),
+            })
+        except Exception as e:
+            failed += 1
+            log.log(f"ERROR clip={row['clip_id']} ({row['emotion']}): "
+                    f"{type(e).__name__}: {e} | skipped (resume-safe)", force=True)
+            continue
+        dt = time.time() - ct0
+        times.append(dt)
+        completed = len(writer.completed)
+        remaining = max(0, total_target - completed)
+        avg = sum(times) / len(times)
+        log.log(f"clip {completed}/{total_target} | +{dt:.2f}s avg={avg:.2f}s "
+                f"| left={remaining} ETA={avg * remaining / 3600:.2f}h "
+                f"| failed={failed} | {row['clip_id']} ({row['emotion']})")
+    writer.close()
+    log.log(f"=== phaseA extraction END | completed={len(writer.completed)}/{total_target} "
+            f"failed={failed} | elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
+    print("done. total completed:", len(writer.completed), "| failed:", failed,
+          "| log:", log.path)
 '''),
 code(r'''
 import collections
@@ -634,7 +653,8 @@ P.REPORTS.mkdir(parents=True, exist_ok=True)
 plt.tight_layout()
 plt.savefig(P.REPORTS / "phaseA_feature_sanity.png", dpi=130)
 plt.show()
-del lm, lm_gen, mimi
+for _n in ("lm", "lm_gen", "mimi"):
+    globals().pop(_n, None)
 eh.free_gpu()
 print("→ continue with 03_train_and_evaluate_head_phaseA.ipynb")
 '''),
@@ -948,66 +968,87 @@ for e in eh.EMOTIONS:
 NB04 += [
 code(r'''
 from tqdm.auto import tqdm
-log = eh.ProgressLogger(P.GEN / "generate.log", echo_every=25)
-writer = eh.ShardWriter(P.GEN, "gen", clips_per_shard=128)
+N_GPUS = torch.cuda.device_count()
 previews = {}
-qa_fail = collections.Counter()
-todo = [s for s in samples if s["sample_id"] not in writer.completed]
-total_target = len(writer.completed) + len(todo)
-log.log(f"=== generation START | completed={len(writer.completed)} todo={len(todo)} "
-        f"target={total_target} | max_reply={MAX_REPLY_S}s stop_silence={STOP_SILENCE_S}s",
-        force=True)
-t0 = time.time()
-failed, times = 0, []
-min_frames = int(MIN_REPLY_S * eh.FRAME_HZ)
-for s in tqdm(todo, total=len(todo)):
-    ct0 = time.time()
-    try:
-        user = eh.read_channel(s["wav_path"], 1)   # right channel = user
-        eh.restore_streaming_state(lm_gen, mimi, prompt_states[s["emotion"]])
-        out = eh.generate_reply(lm_gen, mimi, user, max_reply_s=MAX_REPLY_S,
-                                min_reply_s=MIN_REPLY_S, stop_silence_s=STOP_SILENCE_S,
-                                device=DEVICE)
-        T = out["codes"].shape[0]
-        reply_frames = T - out["n_user_frames"]
-        speak = float((out["rms"][out["n_user_frames"]:] > 0.006).mean()) if reply_frames > 0 else 0.0
-        if reply_frames < min_frames:
-            qa_fail["too_short"] += 1
+if N_GPUS > 1:
+    # one spawned worker per GPU (bf16 emotionplex-7b on each), per-GPU shard
+    # prefix (gen_g<i>) and log (generate_g<i>.log). Resume: re-run this cell.
+    print(f"multi-GPU: {N_GPUS} GPUs -> {N_GPUS} generation workers (round-robin)")
+    for _n in ("lm", "lm_gen", "mimi"):
+        globals().pop(_n, None)     # free the in-kernel model so GPU0 has room
+    eh.free_gpu()
+    eh.generate_multi(samples, str(P.ROOT), N_GPUS,
+                      dict(model_st=str(GEN_DIR / "model.safetensors"),
+                           max_reply_s=MAX_REPLY_S, min_reply_s=MIN_REPLY_S,
+                           stop_silence_s=STOP_SILENCE_S))
+    print("all workers done | shards:", len(list(P.GEN.glob("gen*_shard_*.pt"))),
+          "| logs:", sorted(p.name for p in P.GEN.glob("generate*.log")))
+else:
+    log = eh.ProgressLogger(P.GEN / "generate.log", echo_every=25)
+    writer = eh.ShardWriter(P.GEN, "gen", clips_per_shard=128)
+    qa_fail = collections.Counter()
+    todo = [s for s in samples if s["sample_id"] not in writer.completed]
+    total_target = len(writer.completed) + len(todo)
+    log.log(f"=== generation START | completed={len(writer.completed)} todo={len(todo)} "
+            f"target={total_target} | max_reply={MAX_REPLY_S}s stop_silence={STOP_SILENCE_S}s",
+            force=True)
+    t0 = time.time()
+    failed, times = 0, []
+    min_frames = int(MIN_REPLY_S * eh.FRAME_HZ)
+    for s in tqdm(todo, total=len(todo)):
+        ct0 = time.time()
+        try:
+            user = eh.read_channel(s["wav_path"], 1)   # right channel = user
+            eh.restore_streaming_state(lm_gen, mimi, prompt_states[s["emotion"]])
+            out = eh.generate_reply(lm_gen, mimi, user, max_reply_s=MAX_REPLY_S,
+                                    min_reply_s=MIN_REPLY_S, stop_silence_s=STOP_SILENCE_S,
+                                    device=DEVICE)
+            T = out["codes"].shape[0]
+            reply_frames = T - out["n_user_frames"]
+            speak = float((out["rms"][out["n_user_frames"]:] > 0.006).mean()) if reply_frames > 0 else 0.0
+            if reply_frames < min_frames:
+                qa_fail["too_short"] += 1
+                continue
+            if not (0.05 <= speak <= 0.97):
+                qa_fail["speak_fraction"] += 1
+                continue
+            rec = dict(clip_id=s["sample_id"], src_clip=s["clip_id"], user_id=s["user_id"],
+                       emotion=s["emotion"], label=eh.EMO2ID[s["emotion"]],
+                       codes=out["codes"],
+                       text_tokens=torch.from_numpy(out["text_tokens"]).to(torch.int32),
+                       pcm=torch.from_numpy(out["pcm"]).to(torch.float16),
+                       rms=torch.from_numpy(out["rms"]).to(torch.float16),
+                       n_user_frames=out["n_user_frames"], user_codes=out["user_codes"])
+            writer.add(rec)
+            previews.setdefault(s["emotion"], rec)
+        except Exception as e:
+            failed += 1
+            log.log(f"ERROR sample={s['sample_id']} ({s['emotion']}): "
+                    f"{type(e).__name__}: {e} | skipped (resume-safe)", force=True)
             continue
-        if not (0.05 <= speak <= 0.97):
-            qa_fail["speak_fraction"] += 1
-            continue
-        rec = dict(clip_id=s["sample_id"], src_clip=s["clip_id"], user_id=s["user_id"],
-                   emotion=s["emotion"], label=eh.EMO2ID[s["emotion"]],
-                   codes=out["codes"],
-                   text_tokens=torch.from_numpy(out["text_tokens"]).to(torch.int32),
-                   pcm=torch.from_numpy(out["pcm"]).to(torch.float16),
-                   rms=torch.from_numpy(out["rms"]).to(torch.float16),
-                   n_user_frames=out["n_user_frames"], user_codes=out["user_codes"])
-        writer.add(rec)
-        previews.setdefault(s["emotion"], rec)
-    except Exception as e:
-        failed += 1
-        log.log(f"ERROR sample={s['sample_id']} ({s['emotion']}): "
-                f"{type(e).__name__}: {e} | skipped (resume-safe)", force=True)
-        continue
-    dt = time.time() - ct0
-    times.append(dt)
-    completed = len(writer.completed)
-    remaining = max(0, total_target - completed)
-    avg = sum(times) / len(times)
-    log.log(f"sample {completed}/{total_target} | +{dt:.1f}s avg={avg:.1f}s "
-            f"| left={remaining} ETA={avg * remaining / 3600:.2f}h "
-            f"| qa_rej={sum(qa_fail.values())} failed={failed} | {s['sample_id']} ({s['emotion']})")
-writer.close()
-log.log(f"=== generation END | completed={len(writer.completed)}/{total_target} "
-        f"QA rejected={dict(qa_fail)} failed={failed} "
-        f"| elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
-print("generated:", len(writer.completed), "| QA rejected:", dict(qa_fail),
-      "| failed:", failed, "| log:", log.path)
+        dt = time.time() - ct0
+        times.append(dt)
+        completed = len(writer.completed)
+        remaining = max(0, total_target - completed)
+        avg = sum(times) / len(times)
+        log.log(f"sample {completed}/{total_target} | +{dt:.1f}s avg={avg:.1f}s "
+                f"| left={remaining} ETA={avg * remaining / 3600:.2f}h "
+                f"| qa_rej={sum(qa_fail.values())} failed={failed} | {s['sample_id']} ({s['emotion']})")
+    writer.close()
+    log.log(f"=== generation END | completed={len(writer.completed)}/{total_target} "
+            f"QA rejected={dict(qa_fail)} failed={failed} "
+            f"| elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
+    print("generated:", len(writer.completed), "| QA rejected:", dict(qa_fail),
+          "| failed:", failed, "| log:", log.path)
 '''),
 code(r'''
 from IPython.display import Audio, display
+if not previews:    # multi-GPU run (or resumed kernel): pull previews from shards
+    for rec in eh.iter_shard_records(P.GEN, "gen"):
+        if rec["emotion"] not in previews:
+            previews[rec["emotion"]] = rec
+        if len(previews) == len(eh.EMOTIONS):
+            break
 for e in eh.EMOTIONS:
     rec = previews.get(e)
     if rec is None:
@@ -1016,7 +1057,8 @@ for e in eh.EMOTIONS:
     dur = rec["pcm"].shape[0] / eh.SAMPLE_RATE
     print(f"{e}: {rec['clip_id']} ({dur:.1f}s)")
     display(Audio(rec["pcm"].float().numpy(), rate=eh.SAMPLE_RATE))
-del lm, lm_gen, mimi
+for _n in ("lm", "lm_gen", "mimi"):
+    globals().pop(_n, None)
 eh.free_gpu()
 print("→ continue with 05_extract_indomain_and_train_phaseB.ipynb")
 '''),
@@ -1069,64 +1111,78 @@ print("live prompt prefix ready; cuda mem:",
 NB05 += [
 code(r'''
 from tqdm.auto import tqdm
-man = pd.read_parquet(P.DATA / "manifest.parquet")
-user_of = dict(zip(man.clip_id, man.user_id))
-holdout_users = set(man.loc[man.split == "holdout", "user_id"].unique())
+N_GPUS = torch.cuda.device_count()
+if N_GPUS > 1:
+    # one spawned worker per GPU; each reloads gen shards + manifest and takes
+    # a round-robin partition; per-GPU shard prefix (phaseB_g<i>) + log.
+    # Resume: re-run this cell.
+    print(f"multi-GPU: {N_GPUS} GPUs -> {N_GPUS} phaseB extraction workers")
+    for _n in ("lm", "lm_gen", "mimi"):
+        globals().pop(_n, None)
+    eh.free_gpu()
+    eh.phaseB_extract_multi(str(P.ROOT), N_GPUS, dict())
+    print("all workers done | shards:", len(list(P.FEAT_B.glob("phaseB*_shard_*.pt"))),
+          "| logs:", sorted(p.name for p in P.FEAT_B.glob("extract_phaseB*.log")))
+else:
+    man = pd.read_parquet(P.DATA / "manifest.parquet")
+    user_of = dict(zip(man.clip_id, man.user_id))
+    holdout_users = set(man.loc[man.split == "holdout", "user_id"].unique())
 
-writer = eh.ShardWriter(P.FEAT_B, "phaseB", clips_per_shard=128)
-gen_recs = list(eh.iter_shard_records(P.GEN, "gen"))
-print("generated samples:", len(gen_recs), "| already extracted:", len(writer.completed))
-n_test = max(1, len(gen_recs) // 10)
-test_ids = set(r["clip_id"] for r in gen_recs[-n_test:])   # last 10% = in-domain test
+    writer = eh.ShardWriter(P.FEAT_B, "phaseB", clips_per_shard=128)
+    gen_recs = list(eh.iter_shard_records(P.GEN, "gen"))
+    print("generated samples:", len(gen_recs), "| already extracted:", len(writer.completed))
+    n_test = max(1, len(gen_recs) // 10)
+    test_ids = set(r["clip_id"] for r in gen_recs[-n_test:])   # last 10% = in-domain test
 
-log = eh.ProgressLogger(P.FEAT_B / "extract_phaseB.log", echo_every=25)
-todo = [r for r in gen_recs if r["clip_id"] not in writer.completed]
-total_target = len(writer.completed) + len(todo)
-log.log(f"=== phaseB extraction START | completed={len(writer.completed)} "
-        f"todo={len(todo)} target={total_target}", force=True)
-t0 = time.time()
-failed, times = 0, []
-for r in tqdm(todo, total=len(todo)):
-    ct0 = time.time()
-    try:
-        eh.restore_streaming_state(lm_gen, mimi, prompt_state)
-        feats = eh.extract_from_codes(lm_gen, mimi, r["user_codes"].long(), r["codes"].long(),
-                                      r["text_tokens"].long().numpy(), DEVICE)
-        T = feats["hidden"].shape[0]
-        rms = r["rms"].float().numpy()
-        mask = np.zeros(T, dtype=bool)
-        for t in range(int(r["n_user_frames"]), T):
-            mask[t] = rms[t] > 0.006
-        uid = r.get("user_id") or user_of.get(r["src_clip"], "")
-        if uid in holdout_users:
-            split = "holdout"
-        elif r["clip_id"] in test_ids:
-            split = "test_indomain"
-        else:
-            split = "train"
-        feats["pros"] = torch.from_numpy(eh.prosody_features(r["pcm"].float().numpy()))
-        writer.add(dict(clip_id=r["clip_id"], **feats,
-                        agent_mask=torch.from_numpy(mask), label=int(r["label"]),
-                        user_emotion=-1, user_id=uid, split=split,
-                        text_stream=r["text_tokens"]))
-    except Exception as e:
-        failed += 1
-        log.log(f"ERROR sample={r['clip_id']}: {type(e).__name__}: {e} "
-                f"| skipped (resume-safe)", force=True)
-        continue
-    dt = time.time() - ct0
-    times.append(dt)
-    completed = len(writer.completed)
-    remaining = max(0, total_target - completed)
-    avg = sum(times) / len(times)
-    log.log(f"sample {completed}/{total_target} | +{dt:.2f}s avg={avg:.2f}s "
-            f"| left={remaining} ETA={avg * remaining / 3600:.2f}h "
-            f"| failed={failed} | {r['clip_id']}")
-writer.close()
-log.log(f"=== phaseB extraction END | completed={len(writer.completed)}/{total_target} "
-        f"failed={failed} | elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
-print("phaseB extracted:", len(writer.completed), "| failed:", failed, "| log:", log.path)
-del lm, lm_gen, mimi
+    log = eh.ProgressLogger(P.FEAT_B / "extract_phaseB.log", echo_every=25)
+    todo = [r for r in gen_recs if r["clip_id"] not in writer.completed]
+    total_target = len(writer.completed) + len(todo)
+    log.log(f"=== phaseB extraction START | completed={len(writer.completed)} "
+            f"todo={len(todo)} target={total_target}", force=True)
+    t0 = time.time()
+    failed, times = 0, []
+    for r in tqdm(todo, total=len(todo)):
+        ct0 = time.time()
+        try:
+            eh.restore_streaming_state(lm_gen, mimi, prompt_state)
+            feats = eh.extract_from_codes(lm_gen, mimi, r["user_codes"].long(), r["codes"].long(),
+                                          r["text_tokens"].long().numpy(), DEVICE)
+            T = feats["hidden"].shape[0]
+            rms = r["rms"].float().numpy()
+            mask = np.zeros(T, dtype=bool)
+            for t in range(int(r["n_user_frames"]), T):
+                mask[t] = rms[t] > 0.006
+            uid = r.get("user_id") or user_of.get(r["src_clip"], "")
+            if uid in holdout_users:
+                split = "holdout"
+            elif r["clip_id"] in test_ids:
+                split = "test_indomain"
+            else:
+                split = "train"
+            feats["pros"] = torch.from_numpy(eh.prosody_features(r["pcm"].float().numpy()))
+            writer.add(dict(clip_id=r["clip_id"], **feats,
+                            agent_mask=torch.from_numpy(mask), label=int(r["label"]),
+                            user_emotion=-1, user_id=uid, split=split,
+                            text_stream=r["text_tokens"]))
+        except Exception as e:
+            failed += 1
+            log.log(f"ERROR sample={r['clip_id']}: {type(e).__name__}: {e} "
+                    f"| skipped (resume-safe)", force=True)
+            continue
+        dt = time.time() - ct0
+        times.append(dt)
+        completed = len(writer.completed)
+        remaining = max(0, total_target - completed)
+        avg = sum(times) / len(times)
+        log.log(f"sample {completed}/{total_target} | +{dt:.2f}s avg={avg:.2f}s "
+                f"| left={remaining} ETA={avg * remaining / 3600:.2f}h "
+                f"| failed={failed} | {r['clip_id']}")
+    writer.close()
+    log.log(f"=== phaseB extraction END | completed={len(writer.completed)}/{total_target} "
+            f"failed={failed} | elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
+    print("phaseB extracted:", len(writer.completed), "| failed:", failed, "| log:", log.path)
+for _n in ("lm", "lm_gen", "mimi"):
+    globals().pop(_n, None)
 eh.free_gpu()
 '''),
 code(r'''
