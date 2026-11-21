@@ -59,13 +59,62 @@ EMOPLEX_REPO = "frabonzi/emotionplex-7b"
 
 
 # ---------------------------------------------------------------------------
+# Run mode (FULL vs SMOKE_TEST). The flag is set ONCE in NB00's first cell
+# (which writes <root>/run_config.json); every other notebook — and every
+# spawned GPU worker — reads it back through get_paths(), so the whole
+# pipeline resolves the same mode without any per-notebook edits.
+# ---------------------------------------------------------------------------
+SMOKE_DIRNAME = "_smoke"
+RUN_CONFIG_NAME = "run_config.json"
+
+
+def write_run_mode(root, smoke: bool) -> dict:
+    """Persist the run mode for this root (NB00's first cell calls this)."""
+    cfg = {"smoke_test": bool(smoke), "version": 1,
+           "written": time.strftime("%Y-%m-%d %H:%M:%S")}
+    p = Path(root) / RUN_CONFIG_NAME
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(cfg, indent=2))
+    return cfg
+
+
+def read_smoke_mode(root=None) -> bool:
+    """Mode resolution order: EMOTION_HEAD_SMOKE env var (1/0; automation
+    override only) > <root>/run_config.json (written by NB00) > FULL (default;
+    a missing file always means the full pipeline)."""
+    env = os.environ.get("EMOTION_HEAD_SMOKE", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    root = Path(root or os.environ.get("EMOTION_HEAD_ROOT", "/workspace/emotion_head"))
+    cfg = root / RUN_CONFIG_NAME
+    if cfg.exists():
+        try:
+            return bool(json.loads(cfg.read_text()).get("smoke_test", False))
+        except Exception:
+            return False
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-def get_paths(root=None) -> SimpleNamespace:
+def get_paths(root=None, smoke=None) -> SimpleNamespace:
+    """ROOT holds the SHARED assets (checkpoints, prompts, raw dataset).
+    Derived artifacts (manifest, features, gen, models, reports, deploy_out)
+    live under OUT — which is ROOT itself in full mode (legacy layout, fully
+    compatible with existing runs) and ROOT/_smoke in smoke mode, so a smoke
+    run can never touch full-run artifacts."""
     root = Path(root or os.environ.get("EMOTION_HEAD_ROOT", "/workspace/emotion_head"))
+    if smoke is None:
+        smoke = read_smoke_mode(root)
     ckpt = root / "checkpoints" / "personaplex_bnb4"
+    out = root / SMOKE_DIRNAME if smoke else root
     return SimpleNamespace(
         ROOT=root,
+        SMOKE=bool(smoke),
+        OUT=out,
         CKPT=ckpt,
         MOSHI_BNB4=ckpt / "model_bnb_4bit.pt",
         MIMI_FILE=ckpt / "tokenizer-e351c8d8-checkpoint125.safetensors",
@@ -74,14 +123,91 @@ def get_paths(root=None) -> SimpleNamespace:
         MOSHI_ROOT=ckpt / "moshi",
         PROMPTS=root / "prompts",
         TEXT_PROMPT_FILE=root / "prompts" / "RB_Robert_System_Prompt_full.txt",
-        DATA=root / "data" / "emotionplex",
-        GEN=root / "data" / "indomain",
-        FEAT_A=root / "features" / "phaseA",
-        FEAT_B=root / "features" / "phaseB",
-        MODELS=root / "models",
-        REPORTS=root / "reports",
-        DEPLOY=root / "deploy_out",
+        DATA=root / "data" / "emotionplex",   # raw downloads (shared by both modes)
+        MANIFEST=out / "data" / "emotionplex" / "manifest.parquet",
+        GEN=out / "data" / "indomain",
+        FEAT_A=out / "features" / "phaseA",
+        FEAT_B=out / "features" / "phaseB",
+        MODELS=out / "models",
+        REPORTS=out / "reports",
+        DEPLOY=out / "deploy_out",
     )
+
+
+def mode_banner(P) -> None:
+    """Loud per-notebook mode banner (called by the shared setup cell)."""
+    if P.SMOKE:
+        msg = f"MODE: SMOKE_TEST — tiny end-to-end verification; outputs -> {P.OUT}"
+    else:
+        msg = f"MODE: FULL — outputs -> {P.ROOT}"
+    bar = "=" * max(60, len(msg) + 2)
+    print(bar)
+    print(msg)
+    print(bar)
+
+
+def run_profile(paths=None) -> SimpleNamespace:
+    """Every size knob of the pipeline in one place. The FULL values are the
+    historical hard-coded ones (unchanged behaviour); SMOKE shrinks data,
+    epochs and steps for a fast end-to-end verification. Notebook parameter
+    cells read these (`RUN.nb03_epochs` etc.) so a value can still be
+    hand-overridden in the notebook when needed."""
+    smoke = paths.SMOKE if paths is not None else read_smoke_mode()
+    full = dict(
+        # NB00 downloads (smoke: stratified subset chosen from a sidecar pool)
+        nb00_download_all_audio=True, nb00_max_clips_subset=8000,
+        smoke_sidecar_candidates_train=0, smoke_sidecar_candidates_val=0,
+        smoke_train_clips_per_emotion=0, smoke_val_clips_per_emotion=0,
+        # NB02 phase A extraction (eval = per-split-per-emotion cap, val+holdout)
+        nb02_max_clips=8000, nb02_eval_clips_per_emotion=200, nb02_clips_per_shard=256,
+        # NB03 phase A training
+        nb03_batch_size=16, nb03_epochs=12, nb03_patience=3,
+        # NB04 in-domain generation
+        nb04_n_samples=4000, nb04_max_reply_s=18.0, nb04_stop_silence_s=2.0,
+        nb04_min_reply_s=0.5, nb04_gen_clips_per_shard=128,
+        # NB05 phase B extraction + training
+        nb05_epochs=8, nb05_batch_size=16, nb05_patience=3, nb05_clips_per_shard=128,
+        # NB06 deploy/replay
+        nb06_replay_clips=24, nb06_latency_iters=1000,
+    )
+    smoke_cfg = dict(
+        nb00_download_all_audio=False, nb00_max_clips_subset=8000,
+        smoke_sidecar_candidates_train=100, smoke_sidecar_candidates_val=30,
+        smoke_train_clips_per_emotion=10, smoke_val_clips_per_emotion=3,
+        nb02_max_clips=8000, nb02_eval_clips_per_emotion=200, nb02_clips_per_shard=8,
+        nb03_batch_size=4, nb03_epochs=2, nb03_patience=2,
+        nb04_n_samples=12, nb04_max_reply_s=8.0, nb04_stop_silence_s=1.0,
+        nb04_min_reply_s=0.5, nb04_gen_clips_per_shard=4,
+        nb05_epochs=2, nb05_batch_size=4, nb05_patience=2, nb05_clips_per_shard=8,
+        nb06_replay_clips=8, nb06_latency_iters=200,
+    )
+    assert set(full) == set(smoke_cfg), "full/smoke profile keys diverged"
+    return SimpleNamespace(**(smoke_cfg if smoke else full))
+
+
+def smoke_artifact_check(P) -> bool:
+    """NB06 smoke finale: verify every pipeline artifact exists and print a
+    clear PASS / MISSING list."""
+    checks = {
+        "manifest.parquet": P.MANIFEST.exists(),
+        "phaseA shards": any(P.FEAT_A.glob("phaseA*_shard_*.pt")),
+        "head_phaseA.pt": (P.MODELS / "head_phaseA.pt").exists(),
+        "phaseA_metrics.json": (P.REPORTS / "phaseA_metrics.json").exists(),
+        "gen shards": any(P.GEN.glob("gen*_shard_*.pt")),
+        "phaseB shards": any(P.FEAT_B.glob("phaseB*_shard_*.pt")),
+        "helium_emotion_head_final.pt": (P.MODELS / "helium_emotion_head_final.pt").exists(),
+        "config.json": (P.MODELS / "config.json").exists(),
+        "eval_report.json": (P.REPORTS / "eval_report.json").exists(),
+        "deploy helium_emotion.py": (P.DEPLOY / "helium_emotion.py").exists(),
+        "deploy integrate_helium_emotion.py": (P.DEPLOY / "integrate_helium_emotion.py").exists(),
+    }
+    print("smoke artifact check:")
+    for k, v in checks.items():
+        print(f"  {'OK      ' if v else 'MISSING '} {k}")
+    ok = all(checks.values())
+    print("SMOKE PIPELINE PASSED — all artifacts present" if ok
+          else "SMOKE PIPELINE INCOMPLETE — see MISSING above")
+    return ok
 
 
 def ensure_moshi_importable(paths) -> str:
@@ -648,6 +774,10 @@ class HysteresisSmoother:
         self.steps += 1
         return self._cur, float(self._ema[self._cur]), switched
 
+    @property
+    def current(self) -> int:
+        return self._cur
+
     def switches_per_min(self) -> float:
         minutes = self.steps / FRAME_HZ / 60.0
         return self.switches / minutes if minutes > 0 else 0.0
@@ -756,16 +886,33 @@ def read_channel(path, channel: int, sr: int = SAMPLE_RATE) -> np.ndarray:
 # Training / evaluation helpers (used by notebooks 03 and 05)
 # ---------------------------------------------------------------------------
 def evaluate_head(model, loader, device="cuda"):
+    """Returns (logits [N, T_max, C], labels [N], masks [N, T_max]). Batches are
+    zero-padded to the longest sequence in the WHOLE loader before cat — a
+    plain torch.cat crashes whenever batches have different padded lengths,
+    and the padded frames are always masked out downstream."""
     model.eval()
     logits_all, labels_all, masks_all = [], [], []
+    t_max = 0
     with torch.no_grad():
         for H, M, PR, MK, LB in loader:
             with torch.autocast("cuda", torch.bfloat16, enabled=(device == "cuda")):
                 logits = model(H.to(device), M.to(device), PR.to(device))
+            t_max = max(t_max, int(logits.shape[1]))
             logits_all.append(logits.float().cpu())
             labels_all.append(LB)
             masks_all.append(MK)
-    return torch.cat(logits_all), torch.cat(labels_all), torch.cat(masks_all)
+
+    def _pad_cat(xs):
+        out = []
+        for x in xs:
+            if x.shape[1] < t_max:
+                pad = torch.zeros(x.shape[0], t_max - x.shape[1], *x.shape[2:],
+                                  dtype=x.dtype)
+                x = torch.cat([x, pad], dim=1)
+            out.append(x)
+        return torch.cat(out)
+
+    return _pad_cat(logits_all), torch.cat(labels_all), _pad_cat(masks_all)
 
 
 def macro_f1_from_logits(logits, labels, masks) -> float:
@@ -938,8 +1085,11 @@ def _phaseA_worker(gpu_id, n_gpus, root, jobs, cfg):
 def phaseA_extract_multi(jobs, root, n_gpus, cfg):
     """Spawn one Phase-A extraction worker per GPU. `jobs`: list of small dicts
     (clip_id, wav_path, emotion, user_id, split, user_emotion,
-    agent_turn_frames, agent_words). Blocks until all workers finish."""
+    agent_turn_frames, agent_words). Blocks until all workers finish.
+    Workers are capped at the job count so a tiny (smoke) job list never
+    spawns idle workers that load a full model for nothing."""
     import torch.multiprocessing as tmp
+    n_gpus = max(1, min(int(n_gpus), max(1, len(jobs))))
     tmp.spawn(_phaseA_worker, args=(n_gpus, root, jobs, cfg), nprocs=n_gpus, join=True)
 
 
@@ -1013,8 +1163,10 @@ def _gen_worker(gpu_id, n_gpus, root, samples, cfg):
 def generate_multi(samples, root, n_gpus, cfg):
     """Spawn one in-domain generation worker per GPU (emotionplex-7b bf16 on
     each). cfg: model_st, max_reply_s, min_reply_s, stop_silence_s,
-    clips_per_shard. Blocks until all workers finish."""
+    clips_per_shard. Blocks until all workers finish. Workers are capped at
+    the sample count so a tiny (smoke) list never spawns idle workers."""
     import torch.multiprocessing as tmp
+    n_gpus = max(1, min(int(n_gpus), max(1, len(samples))))
     tmp.spawn(_gen_worker, args=(n_gpus, root, samples, cfg), nprocs=n_gpus, join=True)
 
 
@@ -1023,7 +1175,7 @@ def _phaseB_worker(gpu_id, n_gpus, root, cfg):
     P, sp, mimi, lm_gen = _load_stack_on(root, device)
     prompt_state = _prompt_state_for(lm_gen, mimi, sp, P, True)
     import pandas as pd
-    man = pd.read_parquet(P.DATA / "manifest.parquet")
+    man = pd.read_parquet(P.MANIFEST)
     user_of = dict(zip(man.clip_id, man.user_id))
     holdout_users = set(man.loc[man.split == "holdout", "user_id"].unique())
     gen_recs = list(iter_shard_records(P.GEN, "gen"))
@@ -1083,7 +1235,11 @@ def _phaseB_worker(gpu_id, n_gpus, root, cfg):
 def phaseB_extract_multi(root, n_gpus, cfg):
     """Spawn one Phase-B extraction worker per GPU. Each worker reloads the gen
     shards + manifest (deterministic split assignment) and partitions
-    round-robin. Blocks until all workers finish."""
+    round-robin. Blocks until all workers finish. Workers are capped at the
+    generated-sample count (read cheaply from the shard indexes) so a tiny
+    (smoke) run never spawns idle workers."""
     import torch.multiprocessing as tmp
+    n_samples = len(completed_clip_ids(get_paths(root).GEN, "gen"))
+    n_gpus = max(1, min(int(n_gpus), max(1, n_samples)))
     tmp.spawn(_phaseB_worker, args=(n_gpus, root, cfg), nprocs=n_gpus, join=True)
 

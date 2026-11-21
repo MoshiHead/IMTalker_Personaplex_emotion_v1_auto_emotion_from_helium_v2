@@ -27,6 +27,27 @@ features match what the deployed head will see.
 
 Restart the kernel before 04 and before 05 (frees the previous model's VRAM).
 
+## Smoke test (fast end-to-end verification)
+
+Set `SMOKE_TEST = True` in **NB00's first code cell** and re-run just that cell
+(it rewrites `<root>/run_config.json`), then run **00 → 06 with fresh kernels**.
+Every notebook — and every spawned GPU worker — picks the mode up via
+`eh.get_paths()` and prints a loud `MODE: SMOKE_TEST` banner.
+
+- Scope: ~52 stratified clips (10 train + 3 val per emotion), 2-epoch
+  trainings, 12 generation samples, ~15–25 min total with cached checkpoints
+  (a fresh pod still needs the one-off 17 GB emotionplex-7b download for NB04).
+- Isolation: all derived artifacts (manifest, features, gen, models, reports,
+  deploy_out) land in `<root>/_smoke/` — a smoke run **cannot** touch full-run
+  artifacts. Checkpoints, prompts and the raw dataset downloads stay shared.
+  HF upload in NB06 is force-disabled in smoke mode.
+- Pass criterion: NB06 ends with `SMOKE PIPELINE PASSED` (artifact checklist);
+  quality gates print but are informational only on tiny data.
+- Switch back: `SMOKE_TEST = False`, re-run the cell, restart kernels.
+  Automation override: `EMOTION_HEAD_SMOKE=1/0` env var.
+- Local (no GPU) dry-run of the plumbing: `python emotion_head/_smoke_harness.py`
+  executes the real NB02-selection/NB03/NB05/NB06 cells on synthetic shards.
+
 ## Prerequisites
 
 - `HF_TOKEN` env var. Only `nvidia/personaplex-7b-v1` is gated — accept its

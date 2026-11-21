@@ -26,28 +26,42 @@ for p in nbs:
 checks = {
     "00_setup_and_downloads.ipynb": ["eh.BNB4_REPO", "eh.NVIDIA_REPO", "eh.DATASET_REPO",
                                      "SMOKE TEST OK", "snapshot_download",
-                                     "install_hidden_step", "_env_ok.json"],
+                                     "install_hidden_step", "_env_ok.json",
+                                     "SMOKE_TEST", "run_config.json", "smoke_subset.json"],
     "01_dataset_inspect_and_manifest.ipynb": ["res_emotion", "manifest.parquet",
-                                              "interleaver.py", "holdout"],
+                                              "interleaver.py", "holdout",
+                                              "P.MANIFEST", "smoke_subset.json"],
     "02_extract_features_emotionplex.ipynb": ["USE_LIVE_PROMPT_PREFIX", "PARITY OK",
                                               "cosine_similarity", "ShardWriter",
-                                              "apply_prompts_and_snapshot"],
+                                              "apply_prompts_and_snapshot",
+                                              "EVAL_CLIPS_PER_EMOTION", "P.MANIFEST"],
     "03_train_and_evaluate_head_phaseA.ipynb": ["GATE 1", "GATE 2", "LogisticRegression",
                                                 "train_head", "switches/min",
-                                                "temperature"],
+                                                "temperature", "RUN.nb03_epochs",
+                                                "zero_division=0"],
     "04_generate_indomain_emotionplex7b.ipynb": ["emotionplex-7b", "generate_reply",
                                                  "Answer with a {e} tone.",
-                                                 "prompt_states", "QA rejected"],
+                                                 "prompt_states", "QA rejected",
+                                                 "RUN.nb04_n_samples", "P.MANIFEST"],
     "05_extract_indomain_and_train_phaseB.ipynb": ["extract_from_codes", "test_indomain",
                                                    "helium_emotion_head_final.pt",
-                                                   "config.json", "HysteresisSmoother"],
+                                                   "config.json", "HysteresisSmoother",
+                                                   "RUN.nb05_epochs", "P.MANIFEST"],
     "06_deploy_and_live_replay.ipynb": ["helium_emotion.py", "integrate_helium_emotion.py",
                                         "HeliumEmotionManager", "DEPLOY CHECKLIST",
-                                        "forward_step"],
+                                        "forward_step", "smoke_artifact_check",
+                                        "RUN.nb06_replay_clips"],
 }
 for name, needles in checks.items():
     text = (d / name).read_text(encoding="utf-8")
     for n in needles:
         assert n in text, f"{name}: MISSING {n!r}"
     print(f"{name}: anchors OK ({len(needles)})")
+
+# smoke-mode plumbing must be present in EVERY notebook (shared setup cell)
+for p in nbs:
+    text = p.read_text(encoding="utf-8")
+    for n in ("eh.mode_banner(P)", "RUN = eh.run_profile(P)"):
+        assert n in text, f"{p.name}: MISSING shared smoke plumbing {n!r}"
+print("shared mode plumbing OK in all notebooks")
 print("ALL NOTEBOOKS VALID")

@@ -172,6 +172,14 @@ class HysteresisSmoother:
         self.steps += 1
         return self._cur, float(self._ema[self._cur]), switched
 
+    @property
+    def current(self) -> int:
+        return self._cur
+
+    def switches_per_min(self) -> float:
+        minutes = self.steps / FRAME_HZ / 60.0
+        return self.switches / minutes if minutes > 0 else 0.0
+
 
 # ---------------------------------------------------------------------------
 # Per-step runner (holds GRU state across steps)

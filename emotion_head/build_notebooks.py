@@ -15,8 +15,9 @@ def md(src):
     return {"cell_type": "markdown", "metadata": {}, "source": src.strip() + "\n"}
 
 
-def code(src):
-    return {"cell_type": "code", "execution_count": None, "metadata": {},
+def code(src, tags=()):
+    return {"cell_type": "code", "execution_count": None,
+            "metadata": ({"tags": list(tags)} if tags else {}),
             "outputs": [], "source": src.strip() + "\n"}
 
 
@@ -58,6 +59,8 @@ sys.path.insert(0, os.getcwd())
 import eh_common as eh
 
 P = eh.get_paths()   # override: P = eh.get_paths("/your/root") or set EMOTION_HEAD_ROOT
+eh.mode_banner(P)    # FULL vs SMOKE_TEST — set once in NB00 (run_config.json)
+RUN = eh.run_profile(P)   # all size knobs (full | smoke) — see eh_common.run_profile
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 print("ROOT:", P.ROOT, "| device:", DEVICE)
@@ -82,6 +85,34 @@ Before you start:
 - Upload your local `IMTalker/prompts/RB_Robert_System_Prompt_full.txt` to `<root>/prompts/` (checked below).
 - **License note**: the EmotionPlex dataset audio is Higgs-generated — research / non-commercial use only.
 - Disk: ~45 GB (bnb4 ~6 GB, dataset ~28 GB, emotionplex-7b ~17 GB one-off).
+
+**Run mode**: the first code cell sets `SMOKE_TEST` (default `False`).
+`True` = fast end-to-end verification of the whole pipeline (~52 stratified
+clips, 2-epoch trainings, 12 generation samples; ~15–25 min with cached
+checkpoints). All derived artifacts go to `<root>/_smoke/` and can never touch
+full-run artifacts (checkpoints, prompts and the raw dataset stay shared).
+To switch modes: edit the flag, re-run that ONE cell (it rewrites
+`run_config.json`), then **restart the kernels of the other notebooks** — they
+read the mode via `eh.get_paths()` when their first cell runs.
+'''),
+code(r'''
+# ============================ RUN MODE ============================
+# SMOKE_TEST = False -> the real full pipeline (default).
+# SMOKE_TEST = True  -> tiny end-to-end verification run; outputs isolated in
+#                       <root>/_smoke/ (full-run artifacts untouched).
+# This cell is stdlib-only and takes ~1s: re-run it alone to switch modes.
+SMOKE_TEST = False
+
+import json, os
+from pathlib import Path
+_root = Path(os.environ.get("EMOTION_HEAD_ROOT", "/workspace/emotion_head"))
+_root.mkdir(parents=True, exist_ok=True)
+(_root / "run_config.json").write_text(
+    json.dumps({"smoke_test": bool(SMOKE_TEST), "version": 1}, indent=2))
+print(f"run mode = {'SMOKE_TEST' if SMOKE_TEST else 'FULL'} "
+      f"-> {_root / 'run_config.json'}")
+print("other notebooks (and GPU workers) pick the mode up via eh.get_paths(); "
+      "restart their kernels after switching")
 '''),
 code(r'''
 import sys, torch
@@ -90,7 +121,7 @@ print("torch:", torch.__version__, "cuda:", torch.version.cuda)
 assert torch.cuda.is_available(), "GPU pod required"
 print("gpu:", torch.cuda.get_device_name(0),
       f"{torch.cuda.get_device_properties(0).total_memory/1e9:.0f} GB")
-'''),
+''', tags=("gpu",)),
 code(r'''
 DO_INSTALL = True   # False if your env already matches (e.g. preprocess_5090)
 if DO_INSTALL:
@@ -108,7 +139,7 @@ assert tok, "HF_TOKEN env var is required (gated repos). Set it in the pod env o
 login(token=tok, add_to_git_credential=False)
 print("logged in as:", whoami()["name"])
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-'''),
+''', tags=("download",)),
 code(r'''
 import shutil, tarfile
 from huggingface_hub import snapshot_download, hf_hub_download
@@ -141,7 +172,7 @@ for k in ("MOSHI_BNB4", "MIMI_FILE", "SPM_FILE", "VOICE_PT"):
     print(("OK      " if good else "MISSING "), p,
           f"{p.stat().st_size/1e9:.2f} GB" if good else "")
 assert ok, "checkpoint assets missing"
-'''),
+''', tags=("download",)),
 code(r'''
 import subprocess, sys
 if not (P.MOSHI_ROOT / "pyproject.toml").exists():
@@ -152,7 +183,7 @@ r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e",
 print("pip editable install rc:", r.returncode,
       "(non-zero is fine: sys.path fallback below still makes moshi importable)")
 print("moshi importable:", eh.ensure_moshi_importable(P))
-'''),
+''', tags=("download",)),
 code(r'''
 P.PROMPTS.mkdir(parents=True, exist_ok=True)
 if not P.TEXT_PROMPT_FILE.exists():
@@ -168,6 +199,7 @@ else:
 
 NB00 += [
 code(r'''
+import re
 from huggingface_hub import HfApi, hf_hub_download
 from concurrent.futures import ThreadPoolExecutor
 from tqdm.auto import tqdm
@@ -184,15 +216,75 @@ print("sample audio names:", [f.split("/")[-1] for f in audio_files[:5]])
 def _dl(f):
     return hf_hub_download(eh.DATASET_REPO, f, repo_type="dataset", local_dir=str(P.DATA))
 
-with ThreadPoolExecutor(max_workers=16) as ex:
-    list(tqdm(ex.map(_dl, json_files), total=len(json_files), desc="sidecars"))
-print("sidecars + manifests done")
-'''),
-code(r'''
-DOWNLOAD_ALL_AUDIO = True     # False = only the audio of a random MAX_CLIPS_SUBSET subset
-MAX_CLIPS_SUBSET = 8000
+def _dl_all(fs, desc, workers=16):
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(tqdm(ex.map(_dl, fs), total=len(fs), desc=desc))
 
-if DOWNLOAD_ALL_AUDIO:
+if P.SMOKE:
+    # SMOKE: top-level manifests + sidecars of a small deterministic candidate
+    # pool only (~130 files instead of ~24k), then a stratified final pick.
+    _dl_all([f for f in json_files if "/" not in f], "manifests")
+
+    def _pool_rows(manifest, n):
+        rows = [json.loads(l) for l in open(P.DATA / manifest, encoding="utf-8")
+                if l.strip()]
+        rng = np.random.RandomState(eh.SEED)
+        idx = sorted(rng.permutation(len(rows))[: min(n, len(rows))])
+        return [rows[i] for i in idx]
+
+    pool_tr = _pool_rows("train.jsonl", RUN.smoke_sidecar_candidates_train)
+    pool_va = _pool_rows("val.jsonl", RUN.smoke_sidecar_candidates_val)
+    _dl_all(sorted({str(r["path"]).replace(".wav", ".json") for r in pool_tr + pool_va}),
+            "sidecars (smoke pool)")
+
+    def _emo_of(wav_rel):
+        # agent emotion: sidecar text_prompt "Answer with a {e} tone."
+        try:
+            d = json.loads((P.DATA / wav_rel.replace(".wav", ".json"))
+                           .read_text(encoding="utf-8"))
+            m = re.search(r"a (happy|sad|angry|neutral) tone",
+                          str(d.get("text_prompt", "")).lower())
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        parts = Path(wav_rel).stem.split("_")       # "<user>_<agent>_NNN"
+        return parts[1] if len(parts) > 1 and parts[1] in eh.EMO2ID else None
+
+    rng = np.random.RandomState(eh.SEED)
+    chosen = []
+    for rows, per_emo in ((pool_tr, RUN.smoke_train_clips_per_emotion),
+                          (pool_va, RUN.smoke_val_clips_per_emotion)):
+        by_emo = {e: [] for e in eh.EMOTIONS}
+        for r in rows:
+            e = _emo_of(str(r.get("path", "")))
+            if e:
+                by_emo[e].append(str(r["path"]))
+        for e in eh.EMOTIONS:
+            cand = sorted(by_emo[e])
+            take = [cand[i] for i in rng.permutation(len(cand))[: min(per_emo, len(cand))]]
+            chosen += take
+            print(f"  smoke pool {e}: picked {len(take)}/{len(cand)}")
+    SMOKE_WAVS = sorted(set(chosen))
+    assert SMOKE_WAVS, "smoke subset selection failed — no clips chosen"
+    P.OUT.mkdir(parents=True, exist_ok=True)
+    (P.OUT / "smoke_subset.json").write_text(json.dumps(
+        dict(clips=sorted({Path(w).stem for w in SMOKE_WAVS}), wavs=SMOKE_WAVS),
+        indent=2))
+    print(f"smoke subset: {len(SMOKE_WAVS)} wavs -> {P.OUT / 'smoke_subset.json'}")
+else:
+    _dl_all(json_files, "sidecars")
+print("sidecars + manifests done")
+''', tags=("download",)),
+code(r'''
+DOWNLOAD_ALL_AUDIO = RUN.nb00_download_all_audio   # full True | SMOKE False
+MAX_CLIPS_SUBSET = RUN.nb00_max_clips_subset       # (only if DOWNLOAD_ALL_AUDIO=False by hand)
+
+if P.SMOKE:
+    targets = SMOKE_WAVS     # stratified subset chosen in the sidecar cell
+    print(f"SMOKE: downloading only the {len(targets)} subset wavs "
+          f"(~{len(targets)} files, a few tens of MB)")
+elif DOWNLOAD_ALL_AUDIO:
     targets = audio_files
 else:
     rows = []
@@ -220,7 +312,7 @@ print(f"downloading {len(targets)} audio files")
 with ThreadPoolExecutor(max_workers=8) as ex:
     list(tqdm(ex.map(_dl, targets), total=len(targets), desc="audio"))
 print("wav on disk:", sum(1 for _ in P.DATA.rglob("*.wav")))
-'''),
+''', tags=("download",)),
 code(r'''
 import gc
 sp = eh.load_sp(P)
@@ -245,12 +337,15 @@ print("SMOKE TEST OK — bnb4 loads, live step path works, hidden [4096] + laten
 del lm, lm_gen, mimi
 gc.collect()
 torch.cuda.empty_cache()
-'''),
+''', tags=("gpu",)),
 code(r'''
 marker = dict(time=time.time(), torch=torch.__version__, cuda=torch.version.cuda,
-              gpu=torch.cuda.get_device_name(0))
+              gpu=torch.cuda.get_device_name(0), smoke_test=bool(P.SMOKE))
 P.ROOT.mkdir(parents=True, exist_ok=True)
 (P.ROOT / "_env_ok.json").write_text(json.dumps(marker, indent=2))
+if P.SMOKE:
+    print("SMOKE mode ready: run 01 → 06 with fresh kernels to verify the whole "
+          "pipeline end-to-end (artifacts land in", P.OUT, ")")
 print("Setup complete → continue with 01_dataset_inspect_and_manifest.ipynb")
 '''),
 ]
@@ -289,6 +384,11 @@ for jf in jsonl_files:
 print("manifest rows:", len(rows))
 print("row keys:", sorted(rows[0].keys()))
 print("example row:", {k: rows[0][k] for k in sorted(rows[0])})
+if P.SMOKE:
+    # keep only the stratified subset NB00 picked (deterministic list on disk)
+    keep = set(json.loads((P.OUT / "smoke_subset.json").read_text())["clips"])
+    rows = [r for r in rows if Path(str(r.get("path", ""))).stem in keep]
+    print(f"SMOKE: restricted to the {len(keep)}-clip subset -> {len(rows)} rows")
 '''),
 code(r'''
 from collections import Counter
@@ -415,7 +515,8 @@ train_users = np.array(sorted(df.loc[df.split == "train", "user_id"].unique()))
 rng = np.random.RandomState(eh.SEED)
 holdout = set(rng.permutation(train_users)[: max(1, len(train_users) // 10)])
 df.loc[(df.split == "train") & df.user_id.isin(holdout), "split"] = "holdout"
-df.to_parquet(P.DATA / "manifest.parquet", index=False)
+P.MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+df.to_parquet(P.MANIFEST, index=False)   # full: <data>/manifest.parquet | SMOKE: _smoke/...
 print(df.groupby(["split", "emotion"]).size().unstack(fill_value=0))
 print(f"holdout users: {len(holdout)} | wav coverage: {df.has_wav.mean()*100:.1f}%")
 '''),
@@ -444,7 +545,7 @@ else:
     print("clone failed — check the interleaver convention manually before running 02")
 '''),
 code(r'''
-chk = pd.read_parquet(P.DATA / "manifest.parquet")
+chk = pd.read_parquet(P.MANIFEST)
 assert set(chk.emotion.unique()) <= set(eh.EMOTIONS)
 assert chk.clip_id.is_unique
 assert (chk.n_agent_turns >= 1).mean() > 0.95, "many clips without agent turns - check find_turns"
@@ -478,13 +579,14 @@ Decisions:
 '''),
 code(SHARED),
 code(r'''
-MAX_CLIPS = 8000
+MAX_CLIPS = RUN.nb02_max_clips                            # full 8000 | SMOKE: subset is smaller anyway
+EVAL_CLIPS_PER_EMOTION = RUN.nb02_eval_clips_per_emotion  # per eval split (val, holdout)
 USE_LIVE_PROMPT_PREFIX = True
-CLIPS_PER_SHARD = 256
+CLIPS_PER_SHARD = RUN.nb02_clips_per_shard                # full 256 | smoke 8
 '''),
 code(r'''
 import pandas as pd
-df = pd.read_parquet(P.DATA / "manifest.parquet")
+df = pd.read_parquet(P.MANIFEST)
 df = df[df.has_wav].copy()
 quota = max(1, MAX_CLIPS // len(eh.EMOTIONS))
 # NB: no groupby().apply() here — pandas >= 2.2/3.x drops the grouping column
@@ -492,10 +594,16 @@ quota = max(1, MAX_CLIPS // len(eh.EMOTIONS))
 _parts = [g.sample(min(len(g), quota), random_state=eh.SEED)
           for _, g in df[df.split == "train"].groupby("emotion")]
 assert _parts, "no train rows with has_wav=True — check 01's wav coverage / split columns"
+# eval clips (val + holdout) — REQUIRED by 03's gates/metrics; capped per split
+# per emotion so the eval tail stays cheap. Resume-safe: already-extracted
+# clips are skipped, only the new eval clips are added on a re-run.
+eval_quota = max(1, EVAL_CLIPS_PER_EMOTION)
+_parts += [g.sample(min(len(g), eval_quota), random_state=eh.SEED)
+           for _, g in df[df.split.isin(("val", "holdout"))].groupby(["emotion", "split"])]
 sel = pd.concat(_parts).reset_index(drop=True)
 sel["alignments"] = sel["alignments"].map(json.loads)
 sel["agent_turn_frames"] = sel["agent_turn_frames"].map(json.loads)
-print(sel.emotion.value_counts(), "| total:", len(sel))
+print(sel.groupby(["split", "emotion"]).size().unstack(fill_value=0), "| total:", len(sel))
 
 AGENT_NAMES = {"agent", "assistant", "moshi", "bot", "personaplex",
                "speaker_broker", "speaker_0", "spk0", "left", "0"}
@@ -526,7 +634,7 @@ if USE_LIVE_PROMPT_PREFIX:
 else:
     prompt_state = eh.snapshot_streaming_state(lm_gen)
     print("NO prompt prefix (flag off); state tensors:", len(prompt_state))
-'''),
+''', tags=("gpu",)),
 code(r'''
 # text-stream convention sanity (see 01's interleaver printout for the visual cross-check)
 assert eh.TEXT_PAD == 3 and eh.TEXT_EOP == 0
@@ -536,7 +644,7 @@ for _, row in sel.head(50).iterrows():
     bad += int((stream >= 32000).sum()) + int((stream < 0).sum())
 assert bad == 0, "text piece ids out of range"
 print("text-stream sanity OK (PAD=3, EOP=0, piece ids < 32000)")
-'''),
+''', tags=("gpu",)),
 code(r'''
 # PARITY CHECK: same clip twice with the prompt state restored -> hidden must be
 # bit-near-identical (cosine > 0.999). Proves the snapshot/restore + teacher-forced
@@ -554,7 +662,7 @@ cos = float(torch.nn.functional.cosine_similarity(hiddens[0].flatten(), hiddens[
 print(f"hidden determinism cosine (state restored): {cos:.5f}")
 assert cos > 0.999, "hidden path not deterministic across state restore — do NOT proceed"
 print("PARITY OK")
-'''),
+''', tags=("gpu",)),
 ]
 
 
@@ -629,7 +737,7 @@ else:
             f"failed={failed} | elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
     print("done. total completed:", len(writer.completed), "| failed:", failed,
           "| log:", log.path)
-'''),
+''', tags=("gpu",)),
 code(r'''
 import collections
 import matplotlib.pyplot as plt
@@ -682,13 +790,15 @@ md(r'''
 code(SHARED),
 code(r'''
 import collections
-BATCH_SIZE = 16
-EPOCHS = 12
+BATCH_SIZE = RUN.nb03_batch_size   # full 16 | smoke 4
+EPOCHS = RUN.nb03_epochs           # full 12 | smoke 2
 LR = 3e-4
-PATIENCE = 3
+PATIENCE = RUN.nb03_patience       # full 3 | smoke 2
 GATE1_MIN_F1 = 0.55      # helium-only probe macro-F1 (chance = 0.25)
 GATE2_MIN_GAIN = 0.05    # fusion must beat the best probe by this
 GATE_STRICT = False      # True -> assert gates; False -> print warnings only
+if P.SMOKE:
+    print("SMOKE: gates are informational only — tiny data is not representative")
 '''),
 code(r'''
 recs = list(eh.iter_shard_records(P.FEAT_A, "phaseA"))
@@ -761,12 +871,15 @@ def collate(batch):
     return H, M, PR, MK, LB
 
 g = torch.Generator().manual_seed(eh.SEED)
+BATCH_SIZE = max(1, min(BATCH_SIZE, max(1, len(tr) // 2)))   # tiny-data guard
 train_loader = torch.utils.data.DataLoader(
     SeqDataset(tr), batch_size=BATCH_SIZE, shuffle=True,
     collate_fn=collate, generator=g, drop_last=True)
 val_loader = torch.utils.data.DataLoader(
     SeqDataset(va or ho), batch_size=BATCH_SIZE, collate_fn=collate)
-print(f"batches: train {len(train_loader)} | val {len(val_loader)}")
+assert len(train_loader) > 0 and len(val_loader) > 0, \
+    f"empty loader: {len(tr)} train / {len(va or ho)} val clips, batch {BATCH_SIZE}"
+print(f"batches: train {len(train_loader)} | val {len(val_loader)} (batch {BATCH_SIZE})")
 '''),
 code(r'''
 model = eh.EmotionFusionHead()
@@ -774,7 +887,8 @@ print(f"head params: {model.count_params()/1e6:.2f}M")
 best_f1, history = eh.train_head(model, train_loader, val_loader, device=DEVICE,
                                  epochs=EPOCHS, lr=LR, patience=PATIENCE)
 eh.save_head(model, P.MODELS / "head_phaseA.pt",
-             extra={"val_macro_f1": best_f1, "history": history})
+             extra={"val_macro_f1": best_f1, "history": history,
+                    "smoke_test": bool(P.SMOKE)})
 print("saved:", P.MODELS / "head_phaseA.pt", "| best val macro-F1:", round(best_f1, 4))
 gate2 = best_f1 >= max(f1_helium, f1_mimi, f1_pros) + GATE2_MIN_GAIN
 print(f"GATE 2 (fusion >= best probe + {GATE2_MIN_GAIN}):", "PASS" if gate2 else "FAIL")
@@ -799,7 +913,8 @@ for i in range(logits.shape[0]):
     m = masks[i]
     yt += labels[i].expand(logits.shape[1])[m].tolist()
     yp += pred[i][m].tolist()
-print(classification_report(yt, yp, target_names=eh.EMOTIONS, digits=3))
+print(classification_report(yt, yp, labels=list(range(len(eh.EMOTIONS))),
+                            target_names=eh.EMOTIONS, digits=3, zero_division=0))
 cm = confusion_matrix(yt, yp, normalize="true")
 fig, ax = plt.subplots(figsize=(5, 4))
 ax.imshow(cm, cmap="Blues", vmin=0, vmax=1)
@@ -820,8 +935,9 @@ code(r'''
 # user-emotion leakage: predicted AGENT emotion must NOT track the USER's emotion
 leak = []
 for i, r in enumerate(eval_recs2):
-    if int(r.get("user_emotion", -1)) >= 0 and r["agent_mask"].any():
-        votes = pred[i][r["agent_mask"]].mode().values
+    mk = r["agent_mask"]
+    if int(r.get("user_emotion", -1)) >= 0 and mk.any():
+        votes = pred[i][: len(mk)][mk].mode().values   # pred is padded to batch T
         leak.append((int(r["user_emotion"]), int(votes)))
 if leak:
     uy = [a for a, _ in leak]
@@ -882,8 +998,11 @@ for i in range(logits.shape[0]):
 
             sm.update(torch.softmax(logits[i, t].float(), -1).numpy())
     sw.append(sm.switches_per_min())
-print(f"smoothed switches/min: mean={np.mean(sw):.2f} p95={np.percentile(sw, 95):.2f} "
-      f"(target < 0.5)")
+if sw:
+    print(f"smoothed switches/min: mean={np.mean(sw):.2f} p95={np.percentile(sw, 95):.2f} "
+          f"(target < 0.5)")
+else:
+    print("no masked eval frames — switching report skipped")
 '''),
 code(r'''
 metrics = dict(
@@ -919,14 +1038,15 @@ trained on Mimi/VARM3-domain audio (the dataset's Higgs voices are off-domain).
 code(SHARED),
 code(r'''
 import collections
-N_SAMPLES = 4000
-MAX_REPLY_S = 18.0
-STOP_SILENCE_S = 2.0
-MIN_REPLY_S = 0.5
+N_SAMPLES = RUN.nb04_n_samples          # full 4000 | smoke 12
+MAX_REPLY_S = RUN.nb04_max_reply_s      # full 18.0 | smoke 8.0
+STOP_SILENCE_S = RUN.nb04_stop_silence_s  # full 2.0 | smoke 1.0
+MIN_REPLY_S = RUN.nb04_min_reply_s
+GEN_CLIPS_PER_SHARD = RUN.nb04_gen_clips_per_shard   # full 128 | smoke 4
 '''),
 code(r'''
 import pandas as pd
-df = pd.read_parquet(P.DATA / "manifest.parquet")
+df = pd.read_parquet(P.MANIFEST)
 df = df[(df.has_wav) & (df.split == "train")].copy()
 src = df.sample(min(len(df), N_SAMPLES), random_state=eh.SEED).reset_index(drop=True)
 samples = [dict(sample_id=f"gen_{i:05d}__{r.clip_id}", clip_id=r.clip_id,
@@ -950,7 +1070,7 @@ lm = eh.load_lm_bf16(GEN_DIR / "model.safetensors", DEVICE, DTYPE)
 print(f"cuda mem: {torch.cuda.memory_allocated()/1e9:.1f} GiB")
 lm_gen = eh.make_lm_gen(lm, DEVICE)
 eh.install_hidden_step(lm_gen)
-'''),
+''', tags=("download", "gpu")),
 code(r'''
 assert P.VOICE_PT.exists(), "VARM3.pt is required for generation (your voice prompt)"
 base_state = eh.snapshot_streaming_state(lm_gen)
@@ -960,7 +1080,7 @@ for e in eh.EMOTIONS:
     prompt_states[e] = eh.apply_prompts_and_snapshot(
         lm_gen, mimi, sp, str(P.VOICE_PT), f"Answer with a {e} tone.")
     print("prompt state ready:", e)
-'''),
+''', tags=("gpu",)),
 ]
 
 
@@ -980,12 +1100,13 @@ if N_GPUS > 1:
     eh.generate_multi(samples, str(P.ROOT), N_GPUS,
                       dict(model_st=str(GEN_DIR / "model.safetensors"),
                            max_reply_s=MAX_REPLY_S, min_reply_s=MIN_REPLY_S,
-                           stop_silence_s=STOP_SILENCE_S))
+                           stop_silence_s=STOP_SILENCE_S,
+                           clips_per_shard=GEN_CLIPS_PER_SHARD))
     print("all workers done | shards:", len(list(P.GEN.glob("gen*_shard_*.pt"))),
           "| logs:", sorted(p.name for p in P.GEN.glob("generate*.log")))
 else:
     log = eh.ProgressLogger(P.GEN / "generate.log", echo_every=25)
-    writer = eh.ShardWriter(P.GEN, "gen", clips_per_shard=128)
+    writer = eh.ShardWriter(P.GEN, "gen", clips_per_shard=GEN_CLIPS_PER_SHARD)
     qa_fail = collections.Counter()
     todo = [s for s in samples if s["sample_id"] not in writer.completed]
     total_target = len(writer.completed) + len(todo)
@@ -1040,7 +1161,7 @@ else:
             f"| elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
     print("generated:", len(writer.completed), "| QA rejected:", dict(qa_fail),
           "| failed:", failed, "| log:", log.path)
-'''),
+''', tags=("gpu",)),
 code(r'''
 from IPython.display import Audio, display
 if not previews:    # multi-GPU run (or resumed kernel): pull previews from shards
@@ -1088,8 +1209,10 @@ import collections
 import pandas as pd
 FINETUNE = True            # False -> train from scratch on A+B
 LR = 1e-4
-EPOCHS = 8
-BATCH_SIZE = 16
+EPOCHS = RUN.nb05_epochs               # full 8 | smoke 2
+BATCH_SIZE = RUN.nb05_batch_size       # full 16 | smoke 4
+PATIENCE = RUN.nb05_patience           # full 3 | smoke 2
+CLIPS_PER_SHARD = RUN.nb05_clips_per_shard   # full 128 | smoke 8
 TARGET_SWITCHES_PER_MIN = 0.5
 '''),
 code(r'''
@@ -1104,7 +1227,7 @@ prompt_state = eh.apply_prompts_and_snapshot(
     P.TEXT_PROMPT_FILE.read_text(encoding="utf-8", errors="replace"))
 print("live prompt prefix ready; cuda mem:",
       f"{torch.cuda.memory_allocated()/1e9:.1f} GiB")
-'''),
+''', tags=("gpu",)),
 ]
 
 
@@ -1120,16 +1243,18 @@ if N_GPUS > 1:
     for _n in ("lm", "lm_gen", "mimi"):
         globals().pop(_n, None)
     eh.free_gpu()
-    eh.phaseB_extract_multi(str(P.ROOT), N_GPUS, dict())
+    eh.phaseB_extract_multi(str(P.ROOT), N_GPUS, dict(clips_per_shard=CLIPS_PER_SHARD))
     print("all workers done | shards:", len(list(P.FEAT_B.glob("phaseB*_shard_*.pt"))),
           "| logs:", sorted(p.name for p in P.FEAT_B.glob("extract_phaseB*.log")))
 else:
-    man = pd.read_parquet(P.DATA / "manifest.parquet")
+    man = pd.read_parquet(P.MANIFEST)
     user_of = dict(zip(man.clip_id, man.user_id))
     holdout_users = set(man.loc[man.split == "holdout", "user_id"].unique())
 
-    writer = eh.ShardWriter(P.FEAT_B, "phaseB", clips_per_shard=128)
+    writer = eh.ShardWriter(P.FEAT_B, "phaseB", clips_per_shard=CLIPS_PER_SHARD)
     gen_recs = list(eh.iter_shard_records(P.GEN, "gen"))
+    assert gen_recs, ("no generated samples — run 04 first (SMOKE: QA may have "
+                      "rejected everything; re-run 04 or raise N_SAMPLES)")
     print("generated samples:", len(gen_recs), "| already extracted:", len(writer.completed))
     n_test = max(1, len(gen_recs) // 10)
     test_ids = set(r["clip_id"] for r in gen_recs[-n_test:])   # last 10% = in-domain test
@@ -1184,7 +1309,7 @@ else:
 for _n in ("lm", "lm_gen", "mimi"):
     globals().pop(_n, None)
 eh.free_gpu()
-'''),
+''', tags=("gpu",)),
 code(r'''
 recsA = list(eh.iter_shard_records(P.FEAT_A, "phaseA"))
 recsB = list(eh.iter_shard_records(P.FEAT_B, "phaseB"))
@@ -1194,6 +1319,8 @@ ho = [r for r in recsA if r["split"] == "holdout"] + [r for r in recsB if r["spl
 te = [r for r in recsB if r["split"] == "test_indomain"]
 nA = sum(1 for r in tr if not str(r["clip_id"]).startswith("gen_"))
 print(f"train {len(tr)} (A {nA} + B {len(tr)-nA}) | val {len(va)} | holdout {len(ho)} | testB {len(te)}")
+assert tr, "no training clips — run 02 + 04 first"
+assert te or ho, "no eval clips (test_indomain / holdout) — check 02 and 04 output"
 
 class SeqDataset(torch.utils.data.Dataset):
     def __init__(self, recs):
@@ -1222,11 +1349,15 @@ def collate(batch):
     return H, M, PR, MK, LB
 
 g = torch.Generator().manual_seed(eh.SEED)
+BATCH_SIZE = max(1, min(BATCH_SIZE, max(1, len(tr) // 2)))   # tiny-data guard
 train_loader = torch.utils.data.DataLoader(
     SeqDataset(tr), batch_size=BATCH_SIZE, shuffle=True,
     collate_fn=collate, generator=g, drop_last=True)
 val_loader = torch.utils.data.DataLoader(
     SeqDataset(va), batch_size=BATCH_SIZE, collate_fn=collate)
+assert len(train_loader) > 0 and len(val_loader) > 0, \
+    f"empty loader: {len(tr)} train / {len(va)} val clips, batch {BATCH_SIZE}"
+print(f"batches: train {len(train_loader)} | val {len(val_loader)} (batch {BATCH_SIZE})")
 '''),
 ]
 
@@ -1240,7 +1371,7 @@ else:
     model = eh.EmotionFusionHead()
     print("training from scratch")
 best_f1, history = eh.train_head(model, train_loader, val_loader, device=DEVICE,
-                                 epochs=EPOCHS, lr=LR, patience=3)
+                                 epochs=EPOCHS, lr=LR, patience=PATIENCE)
 print("best val macro-F1:", round(best_f1, 4))
 '''),
 code(r'''
@@ -1281,13 +1412,15 @@ print("chosen smoother config:", {k: round(v, 4) if isinstance(v, float) else v
 code(r'''
 eh.save_head(model, P.MODELS / "helium_emotion_head_final.pt",
              extra=dict(val_macro_f1=best_f1, indomain_test_macro_f1=f1_final,
-                        history=history))
+                        history=history, smoke_test=bool(P.SMOKE)))
 config = dict(head=dict(model.cfg), emotions=eh.EMOTIONS, smoother=best_cfg,
               temperature=1.0, frame_hz=eh.FRAME_HZ, helium_dim=eh.HELIUM_DIM,
-              mimi_latent_dim=eh.MIMI_LATENT_DIM, prosody_dim=eh.PROSODY_DIM)
+              mimi_latent_dim=eh.MIMI_LATENT_DIM, prosody_dim=eh.PROSODY_DIM,
+              smoke_test=bool(P.SMOKE))
 (P.MODELS / "config.json").write_text(json.dumps(config, indent=2))
 report = dict(phaseB_samples=len(recsB), val_macro_f1=best_f1,
-              indomain_test_macro_f1=f1_final, smoother=best_cfg)
+              indomain_test_macro_f1=f1_final, smoother=best_cfg,
+              smoke_test=bool(P.SMOKE))
 (P.REPORTS / "eval_report.json").write_text(json.dumps(report, indent=2))
 print("EXPORTED:", P.MODELS / "helium_emotion_head_final.pt")
 print("         ", P.MODELS / "config.json")
@@ -1316,9 +1449,16 @@ code(r'''
 UPLOAD_HF = False
 HF_UPLOAD_REPO = "YOUR_USER/helium-emotion-head"   # change me
 TEMPLATE_DIR = Path("deploy_template")             # ships with these notebooks
+REPLAY_CLIPS = RUN.nb06_replay_clips               # full 24 | smoke 8
+LATENCY_ITERS = RUN.nb06_latency_iters             # full 1000 | smoke 200
 final = P.MODELS / "helium_emotion_head_final.pt"
 assert final.exists(), "run 05 first"
 assert TEMPLATE_DIR.exists(), "deploy_template/ must sit next to this notebook"
+if P.SMOKE and UPLOAD_HF:
+    UPLOAD_HF = False
+    print("SMOKE: UPLOAD_HF forced off — never publish a smoke-trained head")
+if P.SMOKE:
+    print("SMOKE run — the exported head is NOT trained; do not deploy it")
 '''),
 code(r'''
 import shutil, ast
@@ -1376,11 +1516,12 @@ mgr.stop()
 code(r'''
 # offline replay on in-domain features (stored pros/latents — full fidelity)
 recs = [r for r in eh.iter_shard_records(P.FEAT_B, "phaseB")
-        if r["split"] == "test_indomain"][:24]
+        if r["split"] == "test_indomain"][:REPLAY_CLIPS]
 if not recs:
-    recs = list(eh.iter_shard_records(P.FEAT_B, "phaseB"))[:24]
+    recs = list(eh.iter_shard_records(P.FEAT_B, "phaseB"))[:REPLAY_CLIPS]
 assert recs, "no phaseB features — run 05 first"
 runner = he_deploy.EmotionHeadRunner(final, device=DEVICE)
+torch.set_grad_enabled(False)   # replay is inference-only: no graph on the GRU hidden state
 cfg = json.loads((P.MODELS / "config.json").read_text())["smoother"]
 sm = he_deploy.HysteresisSmoother(ema_alpha=cfg["ema_alpha"],
                                   enter_margin=cfg["enter_margin"],
@@ -1395,7 +1536,7 @@ if DEVICE == "cuda":
         _, hh = runner.head.forward_step(h, m, p, hh)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    N = 1000
+    N = LATENCY_ITERS
     for _ in range(N):
         _, hh = runner.head.forward_step(h, m, p, hh)
     torch.cuda.synchronize()
@@ -1448,6 +1589,9 @@ DEPLOY CHECKLIST (on the live machine):
 6. shortcut: runpod_helium_emotion_streaming.ipynb automates steps 1-5
    (head download from HF, patches, start_winner_live.sh wiring, replay test)
 """)
+if P.SMOKE:
+    # smoke finale: every pipeline artifact must exist
+    assert eh.smoke_artifact_check(P), "smoke pipeline incomplete — see MISSING above"
 '''),
 ]
 
