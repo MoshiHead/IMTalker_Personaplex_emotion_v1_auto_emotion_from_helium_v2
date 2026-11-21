@@ -18,12 +18,30 @@ get_helium_emotion_manager().
 Classes EmotionFusionHead / HysteresisSmoother / prosody_features are
 IDENTICAL copies of the training-side definitions (eh_common.py) so this file
 has no training dependencies.
+
+Live-vs-training parity rules (HELIUM_EMOTION_PATCH_V2):
+  * The GRU sees EVERY 80ms step (training clips were whole sequences), but
+    the smoother is only advanced while the assistant is actually speaking
+    (reply-frame RMS >= helium_gate_rms, the same 0.006 threshold used by the
+    avatar speech gate and the Phase-B training mask). Emotion cannot switch
+    during silence / user speech.
+  * The GRU context is reset after helium_gru_reset_silence_s of continuous
+    assistant silence (a turn boundary; Phase B started every clip from a
+    fresh state). Set it <= 0 to disable.
+  * Smoother defaults come from config.json next to the head (written by
+    training notebook 05); explicit CLI values > 0 override them.
+  * Every smoother update is appended to emotion_logs/helium_emotion_*.csv
+    (IMTALKER_EMOTION_LOG_DIR override) for offline inspection.
 """
 from __future__ import annotations
 
+import csv
+import json
 import math
+import os
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -209,17 +227,46 @@ class HeliumEmotionManager:
         self.head_path = str(getattr(args, "helium_head_path", "") or "helium_emotion_head_final.pt")
         self.device = str(getattr(args, "helium_head_device", "") or "cuda")
         self.temperature = float(getattr(args, "helium_temperature", 1.0))
+        # Smoother defaults: explicit CLI value > 0 wins, else config.json next
+        # to the head (training notebook 05 grid-search), else hardcoded.
+        smooth_cfg = {}
+        cfg_path = Path(self.head_path).with_name("config.json")
+        if cfg_path.exists():
+            try:
+                smooth_cfg = json.loads(cfg_path.read_text()).get("smoother", {}) or {}
+            except Exception:
+                smooth_cfg = {}
+
+        def _pick(arg_name, cfg_key, hard_default):
+            v = float(getattr(args, arg_name, -1.0) or -1.0)
+            if v > 0:
+                return v
+            return float(smooth_cfg.get(cfg_key, hard_default))
+
         self.smoother = HysteresisSmoother(
-            ema_alpha=float(getattr(args, "helium_ema_alpha", 0.4)),
-            enter_margin=float(getattr(args, "helium_enter_margin", 0.15)),
-            min_dwell_s=float(getattr(args, "helium_min_dwell_s", 1.5)),
+            ema_alpha=_pick("helium_ema_alpha", "ema_alpha", 0.4),
+            enter_margin=_pick("helium_enter_margin", "enter_margin", 0.15),
+            min_dwell_s=_pick("helium_min_dwell_s", "min_dwell_s", 1.5),
         )
+        # Smoother gating: only advance while the assistant is speaking
+        # (same threshold as the avatar speech gate / Phase-B training mask).
+        self.gate_rms = float(getattr(args, "helium_gate_rms", 0.006) or 0.006)
+        # GRU context reset after this much continuous assistant silence
+        # (turn boundary; <= 0 disables).
+        self.gru_reset_silence_s = float(getattr(args, "helium_gru_reset_silence_s", 3.0) or 0.0)
+        self._gru_reset_frames = max(0, int(self.gru_reset_silence_s * FRAME_HZ))
+        self._silent_frames = 0
         self._lock = threading.Lock()
         self._runner: EmotionHeadRunner | None = None
         self._mimi = None
         self.steps_fed = 0
+        self.gated_steps = 0
         self.feed_errors = 0
         self._conf = 0.0
+        self._csv_file = None
+        self._csv_writer = None
+        self._log_path = None
+        self._rows_since_flush = 0
 
     def start(self) -> None:
         t0 = time.perf_counter()
@@ -227,11 +274,26 @@ class HeliumEmotionManager:
             raise FileNotFoundError(f"helium head not found: {self.head_path}")
         self._runner = EmotionHeadRunner(self.head_path, device=self.device,
                                          temperature=self.temperature)
+        try:
+            log_dir = os.environ.get("IMTALKER_EMOTION_LOG_DIR", "emotion_logs")
+            Path(log_dir).mkdir(parents=True, exist_ok=True)
+            self._log_path = Path(log_dir) / f"helium_emotion_{datetime.now():%Y%m%d_%H%M%S}.csv"
+            self._csv_file = open(self._log_path, "a", newline="")
+            self._csv_writer = csv.writer(self._csv_file)
+            if self._csv_file.tell() == 0:
+                self._csv_writer.writerow(
+                    ["timestamp", "step", "raw_emotion", "emotion", "confidence", "switched"])
+                self._csv_file.flush()
+        except Exception as exc:
+            print(f"[HELIUM-EMOTION] csv log disabled ({exc!r})", flush=True)
+        sm = self.smoother
         print(
             f"[HELIUM-EMOTION] enabled: head={self.head_path} device={self.device} "
             f"params={sum(p.numel() for p in self._runner.head.parameters())/1e6:.2f}M "
             f"initial_emotion={EMOTION_NAMES.get(self.initial_emotion_id, self.initial_emotion_id)} "
-            f"(loaded in {time.perf_counter() - t0:.1f}s)",
+            f"smoother=(ema={sm.ema_alpha} margin={sm.enter_margin} dwell={sm.min_dwell_frames / FRAME_HZ:.2f}s) "
+            f"gate_rms={self.gate_rms} gru_reset={self.gru_reset_silence_s}s "
+            f"log={self._log_path} (loaded in {time.perf_counter() - t0:.1f}s)",
             flush=True,
         )
 
@@ -251,7 +313,25 @@ class HeliumEmotionManager:
                 return
             probs = self._runner.update_step(
                 helium_hidden, reply_codes, reply_pcm, mimi or self._mimi)
+            rms = 0.0
+            if reply_pcm is not None:
+                arr = np.asarray(reply_pcm, dtype=np.float32).reshape(-1)
+                if arr.size:
+                    rms = float(np.sqrt(np.mean(arr * arr)))
             with self._lock:
+                self.steps_fed += 1
+                if rms < self.gate_rms:
+                    # Assistant silent: the GRU still consumed this step (as in
+                    # training), but the smoother does not advance, so the
+                    # emotion can never switch during silence / user speech.
+                    self._silent_frames += 1
+                    if 0 < self._gru_reset_frames <= self._silent_frames:
+                        # Turn boundary: drop GRU context (Phase B started each
+                        # clip from a fresh state).
+                        self._runner.reset()
+                    return
+                self._silent_frames = 0
+                self.gated_steps += 1
                 eid, conf, switched = self.smoother.update(probs)
                 if switched:
                     print(
@@ -261,11 +341,28 @@ class HeliumEmotionManager:
                     )
                 self._emotion_id = int(eid)
                 self._conf = float(conf)
-                self.steps_fed += 1
+                self._log_row(int(np.argmax(probs)), int(eid), float(conf), bool(switched))
         except Exception as exc:
             self.feed_errors += 1
             if self.feed_errors <= 5:
                 print(f"[HELIUM-EMOTION] feed error #{self.feed_errors}: {exc!r}", flush=True)
+
+    def _log_row(self, raw_eid: int, eid: int, conf: float, switched: bool) -> None:
+        w = self._csv_writer
+        if w is None:
+            return
+        if not switched and self.gated_steps % 25 != 0:
+            return  # every switch + one heartbeat row per ~2s of speech
+        try:
+            w.writerow([datetime.now().isoformat(timespec="milliseconds"),
+                        self.steps_fed, EMOTION_NAMES.get(raw_eid, raw_eid),
+                        EMOTION_NAMES.get(eid, eid), f"{conf:.4f}", int(switched)])
+            self._rows_since_flush += 1
+            if switched or self._rows_since_flush >= 25:
+                self._csv_file.flush()
+                self._rows_since_flush = 0
+        except Exception:
+            pass
 
     def feed_chunk(self, hidden_chunk, codes_chunk=None, pcm_chunk=None, mimi=None) -> None:
         """Convenience: feed a [T, 4096] chunk (e.g. 12 steps) at once."""
@@ -293,11 +390,18 @@ class HeliumEmotionManager:
             self.smoother.reset()
             self._emotion_id = self.initial_emotion_id
             self._conf = 0.0
+            self._silent_frames = 0
             if self._runner is not None:
                 self._runner.reset()
 
     def stop(self) -> None:
-        pass
+        try:
+            if self._csv_file is not None:
+                self._csv_file.close()
+        except Exception:
+            pass
+        self._csv_file = None
+        self._csv_writer = None
 
 
 # ---------------------------------------------------------------------------

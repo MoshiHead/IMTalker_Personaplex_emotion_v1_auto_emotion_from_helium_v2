@@ -1,8 +1,11 @@
+import os
 import sys
 import tempfile
 
 import numpy as np
 import torch
+
+os.environ.setdefault("IMTALKER_EMOTION_LOG_DIR", tempfile.mkdtemp(prefix="helium_compat_logs_"))
 
 sys.path.insert(0, "emotion_head")
 sys.path.insert(0, "emotion_head/deploy_template")
@@ -27,10 +30,15 @@ with tempfile.TemporaryDirectory() as td:
     mgr = hd.HeliumEmotionManager(mgr_args)
     mgr.start()
     mgr.feed(b"\x00" * 1920, 24000)   # mic shim: no-op
-    for _ in range(30):
-        mgr.feed_step(torch.randn(1, 4096), None, None)
+    for _ in range(30):   # loud pcm -> smoother advances (above gate_rms)
+        mgr.feed_step(torch.randn(1, 4096), None,
+                      (np.random.randn(1920) * 0.1).astype("float32"))
     print("manager:", mgr.current_emotion_id(), mgr.current_emotion(),
-          "steps:", mgr.steps_fed, "errors:", mgr.feed_errors)
+          "steps:", mgr.steps_fed, "gated:", mgr.gated_steps, "errors:", mgr.feed_errors)
+    for _ in range(10):   # silence -> smoother frozen, GRU reset after 3s
+        mgr.feed_step(torch.randn(1, 4096), None, np.zeros(1920, dtype="float32"))
+    print("after silence:", mgr.current_emotion_id(), "gated:", mgr.gated_steps,
+          "gru_steps:", mgr._runner.steps)
     mgr.reset_session()
     print("after reset:", mgr.current_emotion_id(), mgr.current_emotion())
 print("DEPLOY_COMPAT_OK")

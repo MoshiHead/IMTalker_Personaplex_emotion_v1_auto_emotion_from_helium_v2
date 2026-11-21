@@ -1351,17 +1351,24 @@ a.helium_emotion = True
 a.helium_head_path = str(final)
 a.helium_head_device = "cpu"
 a.helium_temperature = 1.0
-a.helium_ema_alpha = 0.4
-a.helium_enter_margin = 0.15
-a.helium_min_dwell_s = 1.5
+a.helium_ema_alpha = -1.0        # -1 = auto from config.json next to the head
+a.helium_enter_margin = -1.0
+a.helium_min_dwell_s = -1.0
+a.helium_gate_rms = 0.006        # smoother only advances while assistant speaks
+a.helium_gru_reset_silence_s = 3.0
+import os
+os.environ["IMTALKER_EMOTION_LOG_DIR"] = str(P.REPORTS / "emotion_logs")
 mgr = he_deploy.HeliumEmotionManager(a)
 mgr.start()
 mgr.feed(b"\x00" * 1920, 24000)          # mic shim: must be a no-op, never raise
 pcm = (np.random.randn(1920) * 0.05).astype(np.float32)
 for t in range(25):
     mgr.feed_step(torch.randn(1, eh.HELIUM_DIM), None, pcm)
+for t in range(10):
+    mgr.feed_step(torch.randn(1, eh.HELIUM_DIM), None,
+                  np.zeros(1920, dtype=np.float32))   # silent: smoother frozen
 print("manager smoke:", mgr.current_emotion_id(), mgr.current_emotion(),
-      "| steps:", mgr.steps_fed, "| errors:", mgr.feed_errors)
+      "| steps:", mgr.steps_fed, "| gated:", mgr.gated_steps, "| errors:", mgr.feed_errors)
 mgr.reset_session()
 print("after reset:", mgr.current_emotion_id(), mgr.current_emotion())
 mgr.stop()
@@ -1427,10 +1434,19 @@ DEPLOY CHECKLIST (on the live machine):
    next to the server file (IMTalker/)
 2. copy models/helium_emotion_head_final.pt (+ config.json) there too
 3. python integrate_helium_emotion.py <server_file.py>   # idempotent; writes .bak_helium
+   (run AFTER the streaming notebook's emotion-injection step; marks
+    HELIUM_EMOTION_PATCH_V2, anchors on exact strings, SER + PLAIN profiles)
 4. start the server with:
    --helium_emotion --helium_head_path helium_emotion_head_final.pt
-5. watch for [HELIUM-EMOTION] switch logs; tune --helium_ema_alpha /
-   --helium_enter_margin / --helium_min_dwell_s from config.json values
+   smoother defaults come from config.json; override with --helium_ema_alpha /
+   --helium_enter_margin / --helium_min_dwell_s (values > 0 win);
+   --helium_gate_rms 0.006 and --helium_gru_reset_silence_s 3.0 are the
+   live-parity defaults (smoother only moves while the assistant speaks;
+   GRU context resets at turn boundaries)
+5. watch for [HELIUM-EMOTION] switch logs; the CSV timeline lands in
+   emotion_logs/helium_emotion_*.csv (IMTALKER_EMOTION_LOG_DIR override)
+6. shortcut: runpod_helium_emotion_streaming.ipynb automates steps 1-5
+   (head download from HF, patches, start_winner_live.sh wiring, replay test)
 """)
 '''),
 ]

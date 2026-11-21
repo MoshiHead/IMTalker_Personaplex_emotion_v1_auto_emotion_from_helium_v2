@@ -71,8 +71,18 @@ emotion_head/
 
 1. Copy `deploy_out/helium_emotion.py`, `deploy_out/integrate_helium_emotion.py`,
    `models/helium_emotion_head_final.pt`, `models/config.json` next to the server.
-2. `python integrate_helium_emotion.py <server_file.py>` — idempotent, writes a
-   `.bak_helium` backup, compiles the result, aborts on missing anchors.
+2. `python integrate_helium_emotion.py <server_file.py>` — idempotent exact-anchor
+   patcher (`HELIUM_EMOTION_PATCH_V2`), writes a `.bak_helium` backup, compiles the
+   result, aborts on any anchor mismatch. Works on the SER-patched server (helium
+   overrides the SER emotion; init is independent of `--auto_emotion`) and on the
+   plain server (manager runs + logs; no emotion seam to override).
 3. Start with `--helium_emotion --helium_head_path helium_emotion_head_final.pt`.
-4. Watch for `[HELIUM-EMOTION]` switch logs; tune `--helium_ema_alpha`,
-   `--helium_enter_margin`, `--helium_min_dwell_s` (seeded from `config.json`).
+   Smoother defaults come from `config.json` next to the head; override with
+   `--helium_ema_alpha / --helium_enter_margin / --helium_min_dwell_s` (> 0 wins).
+   `--helium_gate_rms 0.006` only advances the smoother while the assistant speaks
+   (live parity with the Phase-B training mask); `--helium_gru_reset_silence_s 3.0`
+   resets the GRU context at turn boundaries.
+4. Watch for `[HELIUM-EMOTION]` switch logs; the CSV timeline lands in
+   `emotion_logs/helium_emotion_*.csv` (`IMTALKER_EMOTION_LOG_DIR` override).
+   Or use `runpod_helium_emotion_streaming.ipynb` which automates all of this
+   (head download, patches, `start_winner_live.sh` wiring, offline replay test).
