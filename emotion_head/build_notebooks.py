@@ -385,9 +385,12 @@ print("manifest rows:", len(rows))
 print("row keys:", sorted(rows[0].keys()))
 print("example row:", {k: rows[0][k] for k in sorted(rows[0])})
 if P.SMOKE:
-    # keep only the stratified subset NB00 picked (deterministic list on disk)
-    keep = set(json.loads((P.OUT / "smoke_subset.json").read_text())["clips"])
-    rows = [r for r in rows if Path(str(r.get("path", ""))).stem in keep]
+    # keep only the stratified subset (deterministic, on disk). NB00 writes it
+    # during the smoke download; if the dataset was already fully downloaded
+    # (subset file missing), eh.ensure_smoke_subset derives it from the local
+    # manifests instead — no re-download needed.
+    keep = eh.ensure_smoke_subset(P, RUN, rows)
+    rows = [r for r in rows if eh.manifest_clip_stem(r) in keep]
     print(f"SMOKE: restricted to the {len(keep)}-clip subset -> {len(rows)} rows")
 '''),
 code(r'''
@@ -1028,6 +1031,10 @@ trained on Mimi/VARM3-domain audio (the dataset's Higgs voices are off-domain).
   exactly like the live duplex path (`moshi_tokens=None` → sampled).
 - Text prompt `"Answer with a {emotion} tone."` + **your VARM3.pt** voice prompt
   (this is the generation step VARM3 is for).
+- Duplex reply region: clips are `[user speech][gap][agent reply][padding]` on one
+  timeline, so the model replies **inside** the clip. The reply region is defined by
+  content (RMS VAD on the user channel), and the post-clip input is looped roomtone
+  from the clip's own background — never digital zeros (out-of-distribution).
 - Stop rule: model fell silent for `STOP_SILENCE_S` after having spoken; hard cap
   `MAX_REPLY_S`. QA rejects too-short / silent / over-talkative outputs.
 - ~3–6 s per sample on a 5090 → 4k samples ≈ 4–7 h. Resume-safe.
@@ -1126,12 +1133,19 @@ else:
                                     device=DEVICE)
             T = out["codes"].shape[0]
             reply_frames = T - out["n_user_frames"]
+            speak_frames = int((out["rms"][out["n_user_frames"]:] > 0.006).sum())
             speak = float((out["rms"][out["n_user_frames"]:] > 0.006).mean()) if reply_frames > 0 else 0.0
             if reply_frames < min_frames:
                 qa_fail["too_short"] += 1
+                log.log(f"QA too_short {s['sample_id']} ({s['emotion']}): "
+                        f"reply={reply_frames}f speak={speak_frames}f "
+                        f"uend={out['n_user_frames']} T={T}")
                 continue
             if not (0.05 <= speak <= 0.97):
                 qa_fail["speak_fraction"] += 1
+                log.log(f"QA speak_fraction {s['sample_id']} ({s['emotion']}): "
+                        f"speak={speak:.2f} reply={reply_frames}f "
+                        f"uend={out['n_user_frames']} T={T}")
                 continue
             rec = dict(clip_id=s["sample_id"], src_clip=s["clip_id"], user_id=s["user_id"],
                        emotion=s["emotion"], label=eh.EMO2ID[s["emotion"]],
@@ -1235,6 +1249,8 @@ NB05 += [
 code(r'''
 from tqdm.auto import tqdm
 N_GPUS = torch.cuda.device_count()
+# guard both branches: no Phase-B gen shards yet -> show actionable diagnostics
+assert eh.completed_clip_ids(P.GEN, "gen"), "\n" + eh.diagnose_gen_dir(P)
 if N_GPUS > 1:
     # one spawned worker per GPU; each reloads gen shards + manifest and takes
     # a round-robin partition; per-GPU shard prefix (phaseB_g<i>) + log.
@@ -1253,8 +1269,6 @@ else:
 
     writer = eh.ShardWriter(P.FEAT_B, "phaseB", clips_per_shard=CLIPS_PER_SHARD)
     gen_recs = list(eh.iter_shard_records(P.GEN, "gen"))
-    assert gen_recs, ("no generated samples — run 04 first (SMOKE: QA may have "
-                      "rejected everything; re-run 04 or raise N_SAMPLES)")
     print("generated samples:", len(gen_recs), "| already extracted:", len(writer.completed))
     n_test = max(1, len(gen_recs) // 10)
     test_ids = set(r["clip_id"] for r in gen_recs[-n_test:])   # last 10% = in-domain test

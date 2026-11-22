@@ -185,6 +185,99 @@ def run_profile(paths=None) -> SimpleNamespace:
     return SimpleNamespace(**(smoke_cfg if smoke else full))
 
 
+def manifest_clip_stem(row) -> str:
+    """Clip id from a manifest row. The clip manifests (train/val.jsonl) carry
+    a `path` like "stereo_wav/000/<id>.wav"; metadata manifests
+    (dialogues.jsonl) carry a bare `id`. Returns "" when neither is present."""
+    p = str(row.get("path", ""))
+    return Path(p).stem if p else str(row.get("id", ""))
+
+
+def ensure_smoke_subset(P, run, rows) -> set:
+    """Return the smoke clip subset (set of clip stems).
+
+    Reads the file NB00's smoke download cell wrote. If that file is missing —
+    e.g. the dataset was already fully downloaded before smoke mode was
+    enabled, so NB00's smoke cells were never run — derives an equivalent
+    stratified subset (per-emotion, deterministic seed) from the manifest
+    `rows` NB01 already parsed, and writes the file so re-runs and downstream
+    notebooks stay consistent. No downloads happen here.
+    """
+    subset_file = P.OUT / "smoke_subset.json"
+    if subset_file.exists():
+        return set(json.loads(subset_file.read_text())["clips"])
+    print(f"SMOKE: {subset_file} missing (NB00 smoke download cells not run) — "
+          "deriving the stratified subset from the local manifests instead")
+    has_path = any(str(r.get("path", "")) for r in rows)
+    rng = np.random.RandomState(SEED)
+    keep = set()
+    for want_val, per_emo in ((False, run.smoke_train_clips_per_emotion),
+                              (True, run.smoke_val_clips_per_emotion)):
+        by_emo = {e: set() for e in EMOTIONS}
+        for r in rows:
+            if has_path and not str(r.get("path", "")):
+                continue                       # metadata manifests (dialogues.jsonl)
+            is_val = "val" in str(r.get("_manifest", "")).lower()
+            if is_val != want_val:
+                continue
+            stem = manifest_clip_stem(r)
+            e = str(r.get("res_emotion") or "").lower()
+            if e not in EMO2ID:
+                parts = stem.split("_")        # "<user>_<agent>_NNN"
+                e = parts[1] if len(parts) > 1 else ""
+            if stem and e in EMO2ID:
+                by_emo[e].add(stem)
+        for e in EMOTIONS:
+            cand = sorted(by_emo[e])
+            take = [cand[i] for i in rng.permutation(len(cand))[: min(per_emo, len(cand))]]
+            keep.update(take)
+            print(f"  smoke fallback {'val' if want_val else 'train'} {e}: "
+                  f"picked {len(take)}/{len(cand)}")
+    if not keep:
+        raise RuntimeError(
+            "smoke subset fallback found no clips — run NB00's download cells "
+            "(or check the manifest row schema: expected 'path' or 'id')")
+    P.OUT.mkdir(parents=True, exist_ok=True)
+    subset_file.write_text(json.dumps(dict(clips=sorted(keep)), indent=2))
+    print(f"SMOKE: wrote fallback subset ({len(keep)} clips) -> {subset_file}")
+    return keep
+
+
+def diagnose_gen_dir(P) -> str:
+    """Explain why Phase-B gen shards are missing: shows what the gen dir
+    actually contains, the tail of any generate*.log (the QA-reject counters
+    live there), and — in smoke mode — whether the shards landed in the
+    FULL-mode gen dir instead (i.e. NB04 ran with a stale full-mode kernel)."""
+    lines = [f"gen dir: {P.GEN} (exists={P.GEN.exists()})"]
+    shards = sorted(P.GEN.glob("gen*_shard_*.pt"))
+    idx = sorted(P.GEN.glob("gen*_index.json"))
+    lines.append(f"  shard files: {len(shards)} | index files: {len(idx)}")
+    for lg in sorted(P.GEN.glob("generate*.log")):
+        try:
+            tail = lg.read_text(errors="replace").splitlines()[-4:]
+        except Exception:
+            continue
+        lines.append(f"  tail of {lg.name}:")
+        lines.extend("    " + t for t in tail)
+    if P.SMOKE:
+        full_gen = P.ROOT / "data" / "indomain"
+        n_full = len(list(full_gen.glob("gen*_shard_*.pt"))) if full_gen.exists() else 0
+        if n_full:
+            lines.append(
+                f"  CAUSE: the FULL-mode gen dir ({full_gen}) holds {n_full} shard(s) "
+                "— NB04 was run with a full-mode kernel. Re-run NB04 with a FRESH "
+                "kernel after enabling smoke mode (12 samples, a few minutes).")
+        elif not shards:
+            lines.append(
+                "  CAUSE: no gen shards anywhere — run NB04 first (smoke mode, fresh "
+                "kernel). If NB04 already ran, check its QA counters in the log "
+                "above: everything may have been QA-rejected (re-run 04, and consider "
+                "raising nb04_max_reply_s in eh_common.run_profile).")
+    elif not shards:
+        lines.append("  run NB04 first.")
+    return "\n".join(lines)
+
+
 def smoke_artifact_check(P) -> bool:
     """NB06 smoke finale: verify every pipeline artifact exists and print a
     clear PASS / MISSING list."""
@@ -621,18 +714,67 @@ def extract_clip_features(lm_gen, mimi, agent_pcm, user_pcm, text_stream=None,
 # ---------------------------------------------------------------------------
 # Free-running generation (Phase B, emotionplex-7b)
 # ---------------------------------------------------------------------------
+def _prep_user_turn(user_pcm, rms_threshold=0.006):
+    """Pad to whole frames, per-frame user-channel RMS, the content-based
+    user-speech-end frame (RMS VAD; floor = median frame RMS ~= roomtone, with
+    a 0.32s hangover), and the quietest-1s roomtone slice of the clip (the
+    recording's own background). GPU-free helper of generate_reply (unit-
+    tested in _smoke_harness)."""
+    user_pcm = np.asarray(user_pcm, dtype=np.float32).reshape(-1)
+    n_uf = max(1, math.ceil(len(user_pcm) / FRAME_SAMPLES))
+    pad = n_uf * FRAME_SAMPLES - len(user_pcm)
+    if pad:
+        user_pcm = np.pad(user_pcm, (0, pad))
+    urms = np.sqrt((user_pcm.reshape(n_uf, FRAME_SAMPLES) ** 2).mean(axis=1) + 1e-12)
+    floor = float(np.median(urms))
+    speech_thr = max(2.0 * rms_threshold, min(0.03, 6.0 * floor))
+    speech_frames = np.nonzero(urms > speech_thr)[0]
+    if len(speech_frames):
+        hang = max(1, int(0.32 * FRAME_HZ))
+        user_end = min(n_uf, int(speech_frames[-1]) + hang + 1)
+    else:
+        user_end = n_uf                        # no speech detected -> old behavior
+    win = max(1, int(FRAME_HZ))                # 1 s
+    if n_uf > win:
+        w = np.lib.stride_tricks.sliding_window_view(urms, win).mean(axis=1)
+        idx = int(np.argmin(w))
+    else:
+        idx = 0
+    room = user_pcm[idx * FRAME_SAMPLES:(idx + win) * FRAME_SAMPLES]
+    return user_pcm, urms, user_end, room
+
+
 @torch.no_grad()
 def generate_reply(lm_gen, mimi, user_pcm, *, max_reply_s=20.0, min_reply_s=0.5,
                    stop_silence_s=2.0, rms_threshold=0.006, device="cuda") -> dict:
-    """Feed the user channel, then silence; the model free-runs
+    """Feed the user channel, then looped roomtone; the model free-runs
     (moshi_tokens=None -> sampled), exactly like the live duplex path.
-    Returns agent codes [T,8], per-frame text tokens, decoded pcm, per-frame
-    RMS and the user-frame count."""
-    user_codes = mimi_encode_codes(mimi, user_pcm, device)
-    T_user = int(user_codes.shape[0])
-    sil = mimi_encode_codes(mimi, np.zeros(FRAME_SAMPLES, np.float32), device)[0]
-    T_max = T_user + int(max_reply_s * FRAME_HZ)
-    min_frames = T_user + int(min_reply_s * FRAME_HZ)
+
+    Duplex reality (dataset card): each stereo clip is [user speech][gap]
+    [original agent reply][padding] on ONE timeline, with roomtone mixed under
+    the user channel. A duplex model therefore starts replying BEFORE the user
+    clip ends, so the reply region is defined by CONTENT — everything after the
+    user's speech ends (RMS VAD) — not by the clip boundary. After the clip the
+    input switches to looped roomtone (the quietest 1s of the clip's own user
+    channel = the recording's real background, matching the dataset's
+    roomtone-mixed user channel), never digital zeros: the model only ever saw
+    real mic background in training and stays silent on out-of-distribution
+    pure-silence codes (the repo itself uses dedicated SINE tokens, not encoded
+    zeros, for prompt-phase user silence).
+
+    Returns agent codes [T,8] (model output on the whole timeline), per-frame
+    text tokens, decoded pcm, per-frame RMS, the user-speech-end frame
+    (`n_user_frames`; the reply region starts there) and the EXACT fed input
+    codes [T,8] (clip + roomtone, trimmed to T) so teacher-forced extraction
+    replays generation bit-for-bit."""
+    user_pcm, urms, user_end, room = _prep_user_turn(user_pcm, rms_threshold)
+    ext_frames = int(max_reply_s * FRAME_HZ) + 2
+    reps = int(math.ceil(ext_frames * FRAME_SAMPLES / max(1, len(room))))
+    tail_pcm = np.tile(room, reps)[: ext_frames * FRAME_SAMPLES]
+
+    all_codes = mimi_encode_codes(mimi, np.concatenate([user_pcm, tail_pcm]), device)
+    T_max = int(all_codes.shape[0])
+    min_frames = int(min_reply_s * FRAME_HZ)
     stop_frames = max(1, int(stop_silence_s * FRAME_HZ))
     codes, text_tokens, pcm_chunks = [], [], []
     rms = []
@@ -640,10 +782,9 @@ def generate_reply(lm_gen, mimi, user_pcm, *, max_reply_s=20.0, min_reply_s=0.5,
     silent_run = 0
     with mimi.streaming(1):
         for t in range(T_max):
-            inp = user_codes[t] if t < T_user else sil
             out = _step_force(
                 lm_gen,
-                input_tokens=inp.view(1, N_AUDIO_CODEBOOKS, 1).to(device))
+                input_tokens=all_codes[t].view(1, N_AUDIO_CODEBOOKS, 1).to(device))
             tokens = out[0]                              # [1, 9, 1]
             text_tokens.append(int(tokens[0, 0, 0].item()))
             codes.append(tokens[0, 1:, 0].long().cpu())
@@ -652,16 +793,16 @@ def generate_reply(lm_gen, mimi, user_pcm, *, max_reply_s=20.0, min_reply_s=0.5,
             pcm_chunks.append(pcm_f)
             r = float(np.sqrt(np.mean(pcm_f * pcm_f)))
             rms.append(r)
-            if t >= T_user:
+            if t >= user_end:
                 if r > rms_threshold:
                     speaking = True
                     silent_run = 0
                 else:
                     silent_run += 1
-                if t >= min_frames and speaking and silent_run >= stop_frames:
+                if speaking and silent_run >= stop_frames and (t - user_end) >= min_frames:
                     break
     T_out = len(codes)
-    while T_out > T_user + 1 and rms[T_out - 1] <= rms_threshold:
+    while T_out > user_end + 1 and rms[T_out - 1] <= rms_threshold:
         T_out -= 1
     codes = torch.stack(codes)[:T_out]
     pcm = np.concatenate(pcm_chunks)[: T_out * FRAME_SAMPLES] if pcm_chunks else np.zeros(0, np.float32)
@@ -670,8 +811,8 @@ def generate_reply(lm_gen, mimi, user_pcm, *, max_reply_s=20.0, min_reply_s=0.5,
         "text_tokens": np.asarray(text_tokens[:T_out], dtype=np.int64),
         "pcm": pcm.astype(np.float32),
         "rms": np.asarray(rms[:T_out], dtype=np.float32),
-        "n_user_frames": T_user,
-        "user_codes": user_codes.to(torch.int16),
+        "n_user_frames": user_end,
+        "user_codes": all_codes[:T_out].to(torch.int16),
     }
 
 
@@ -1125,13 +1266,20 @@ def _gen_worker(gpu_id, n_gpus, root, samples, cfg):
                                  device=device)
             T = out["codes"].shape[0]
             reply_frames = T - out["n_user_frames"]
+            speak_frames = int((out["rms"][out["n_user_frames"]:] > 0.006).sum())
             speak = (float((out["rms"][out["n_user_frames"]:] > 0.006).mean())
                      if reply_frames > 0 else 0.0)
             if reply_frames < min_frames:
                 qa_fail["too_short"] += 1
+                log.log(f"[gpu{gpu_id}] QA too_short {s['sample_id']} ({s['emotion']}): "
+                        f"reply={reply_frames}f speak={speak_frames}f "
+                        f"uend={out['n_user_frames']} T={T}")
                 continue
             if not (0.05 <= speak <= 0.97):
                 qa_fail["speak_fraction"] += 1
+                log.log(f"[gpu{gpu_id}] QA speak_fraction {s['sample_id']} ({s['emotion']}): "
+                        f"speak={speak:.2f} reply={reply_frames}f "
+                        f"uend={out['n_user_frames']} T={T}")
                 continue
             writer.add(dict(
                 clip_id=s["sample_id"], src_clip=s["clip_id"], user_id=s["user_id"],

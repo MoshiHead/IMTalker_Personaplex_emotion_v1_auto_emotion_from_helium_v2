@@ -45,6 +45,10 @@ Every notebook — and every spawned GPU worker — picks the mode up via
   quality gates print but are informational only on tiny data.
 - Switch back: `SMOKE_TEST = False`, re-run the cell, restart kernels.
   Automation override: `EMOTION_HEAD_SMOKE=1/0` env var.
+- Already downloaded the full dataset before enabling smoke mode? That's fine:
+  if NB00's smoke download cells were never run, NB01 derives the same
+  stratified subset from the local manifests (`eh.ensure_smoke_subset`) —
+  no re-download, no crash.
 - Local (no GPU) dry-run of the plumbing: `python emotion_head/_smoke_harness.py`
   executes the real NB02-selection/NB03/NB05/NB06 cells on synthetic shards.
 

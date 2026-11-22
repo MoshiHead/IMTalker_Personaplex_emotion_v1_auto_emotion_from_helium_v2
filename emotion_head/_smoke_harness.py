@@ -98,6 +98,53 @@ check("smoke subset 10+3/emo", (rs.smoke_train_clips_per_emotion,
                                 rs.smoke_val_clips_per_emotion) == (10, 3))
 
 # ---------------------------------------------------------------------------
+# 2b. ensure_smoke_subset fallback (NB01 path when NB00 smoke cells not run)
+# ---------------------------------------------------------------------------
+print("\n== ensure_smoke_subset ==")
+_sub_file = Ps.OUT / "smoke_subset.json"
+if _sub_file.exists():
+    _sub_file.unlink()
+_rows = []
+for i in range(60):
+    e, ue = eh.EMOTIONS[i % 4], eh.EMOTIONS[(i + 1) % 4]
+    _rows.append(dict(path=f"stereo_wav/000/{ue}_{e}_{i:03d}.wav", res_emotion=e,
+                      _manifest=("val.jsonl" if i >= 48 else "train.jsonl")))
+_rows.append(dict(id="happy_happy_900", res_emotion="happy",
+                  _manifest="dialogues.jsonl"))   # metadata manifest: no path
+keep = eh.ensure_smoke_subset(Ps, rs, _rows)
+check("fallback picks 10 train + 3 val per emotion", len(keep) == 4 * 10 + 4 * 3)
+check("fallback excludes no-path metadata rows", "happy_happy_900" not in keep)
+check("fallback writes the subset file", _sub_file.exists())
+keep2 = eh.ensure_smoke_subset(Ps, rs, _rows)
+check("subset read back from file (deterministic)", keep2 == keep)
+_sub_file.unlink()
+keep3 = eh.ensure_smoke_subset(Ps, rs, _rows)
+check("rebuild is seeded-deterministic", keep3 == keep)
+check("manifest_clip_stem path schema",
+      eh.manifest_clip_stem(_rows[0]) == "happy_neutral_000")
+check("manifest_clip_stem id schema",
+      eh.manifest_clip_stem(_rows[-1]) == "happy_happy_900")
+_sub_file.unlink()
+
+# ---------------------------------------------------------------------------
+# 2c. _prep_user_turn: duplex reply-region VAD + roomtone slice (NB04)
+# ---------------------------------------------------------------------------
+print("\n== _prep_user_turn ==")
+_rngn = np.random.RandomState(0)
+_rt = lambda n: (0.002 * _rngn.randn(int(n))).astype(np.float32)
+_sp = lambda n: (0.15 * np.sin(2 * np.pi * 220 * np.arange(int(n)) / eh.SAMPLE_RATE)).astype(np.float32)
+_pcm = np.concatenate([_rt(2 * eh.SAMPLE_RATE), _sp(2 * eh.SAMPLE_RATE), _rt(4 * eh.SAMPLE_RATE)])
+_up, _ur, _ue, _room = eh._prep_user_turn(_pcm)
+_exp = 4 * eh.FRAME_HZ + max(1, int(0.32 * eh.FRAME_HZ)) + 1     # speech ends ~4s + hangover
+check("VAD finds user speech end ~4s", abs(_ue - _exp) <= 2)
+check("VAD end < clip end (reply region exists)", _ue < int(_ur.shape[0]))
+check("roomtone slice is quiet", float(np.sqrt((_room ** 2).mean())) < 0.01)
+check("roomtone slice is 1s", len(_room) == int(eh.FRAME_HZ) * eh.FRAME_SAMPLES)
+_ue2 = eh._prep_user_turn(_rt(3 * eh.SAMPLE_RATE))[2]
+check("no speech -> end = clip end", _ue2 == int(np.ceil(3 * eh.SAMPLE_RATE / eh.FRAME_SAMPLES)))
+del _rngn, _rt, _sp, _pcm, _up, _ur, _ue, _room, _exp, _ue2
+
+# ---------------------------------------------------------------------------
 # helpers shared by sections 3 and 5
 # ---------------------------------------------------------------------------
 def _synth_rec(cid, label, split, uid, t, user_emo=1):
@@ -181,6 +228,25 @@ finally:
 check("phaseA caps at 1 job", _spawn_calls[0] == ("_phaseA_worker", 1))
 check("gen caps at 2 samples", _spawn_calls[1] == ("_gen_worker", 2))
 check("phaseB caps at 3 gen clips", _spawn_calls[2] == ("_phaseB_worker", 3))
+
+# ---------------------------------------------------------------------------
+# 4b. diagnose_gen_dir (NB05 guard message)
+# ---------------------------------------------------------------------------
+print("\n== diagnose_gen_dir ==")
+tmp2 = Path(tempfile.mkdtemp(prefix="eh_diag_"))
+eh.write_run_mode(tmp2, True)
+P2 = eh.get_paths(tmp2)
+P2.GEN.mkdir(parents=True, exist_ok=True)
+(P2.GEN / "generate.log").write_text("worker start\nQA rejected={'too_short': 12} failed=0\n")
+m = eh.diagnose_gen_dir(P2)
+check("diagnose: empty dirs -> run NB04", "no gen shards anywhere" in m)
+check("diagnose: surfaces QA log tail", "too_short" in m)
+_w = eh.ShardWriter(P2.ROOT / "data" / "indomain", "gen", clips_per_shard=4)
+_w.add(dict(clip_id="gen_00000__x"))
+_w.close()
+m2 = eh.diagnose_gen_dir(P2)
+check("diagnose: detects full-mode strays", "FULL-mode gen dir" in m2 and "FRESH kernel" in m2)
+del tmp2, P2, m, m2
 
 
 # ---------------------------------------------------------------------------
