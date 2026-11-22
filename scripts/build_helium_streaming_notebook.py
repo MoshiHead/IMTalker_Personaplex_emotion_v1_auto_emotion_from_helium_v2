@@ -277,8 +277,8 @@ if cfg_p.exists():
 # latency: pure head forward_step (what the live loop pays per 80ms step)
 hd = payload["cfg"]
 h = torch.randn(1, hd.get("helium_dim", 4096), device=dev)
-m = torch.randn(1, 32 * hd.get("mimi_codebooks", 8), device=dev)
-p = torch.randn(1, 10, device=dev)
+m = torch.randn(1, hd.get("mimi_dim", 512), device=dev)
+p = torch.randn(1, hd.get("pros_dim", 6), device=dev)
 hh = None
 for _ in range(50):
     _, hh = runner.head.forward_step(h, m, p, hh)
