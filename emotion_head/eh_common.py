@@ -164,7 +164,7 @@ def run_profile(paths=None) -> SimpleNamespace:
         nb03_batch_size=16, nb03_epochs=12, nb03_patience=3,
         # NB04 in-domain generation
         nb04_n_samples=4000, nb04_max_reply_s=18.0, nb04_stop_silence_s=2.0,
-        nb04_min_reply_s=0.5, nb04_gen_clips_per_shard=128,
+        nb04_min_reply_s=0.5, nb04_gen_clips_per_shard=128, nb04_max_attempts=2,
         # NB05 phase B extraction + training
         nb05_epochs=8, nb05_batch_size=16, nb05_patience=3, nb05_clips_per_shard=128,
         # NB06 deploy/replay
@@ -177,7 +177,7 @@ def run_profile(paths=None) -> SimpleNamespace:
         nb02_max_clips=8000, nb02_eval_clips_per_emotion=200, nb02_clips_per_shard=8,
         nb03_batch_size=4, nb03_epochs=2, nb03_patience=2,
         nb04_n_samples=12, nb04_max_reply_s=8.0, nb04_stop_silence_s=1.0,
-        nb04_min_reply_s=0.5, nb04_gen_clips_per_shard=4,
+        nb04_min_reply_s=0.5, nb04_gen_clips_per_shard=4, nb04_max_attempts=2,
         nb05_epochs=2, nb05_batch_size=4, nb05_patience=2, nb05_clips_per_shard=8,
         nb06_replay_clips=8, nb06_latency_iters=200,
     )
@@ -396,23 +396,54 @@ def load_lm_bnb4(paths, device="cuda", dtype=torch.bfloat16):
     return _freeze(loaders.get_moshi_lm(str(paths.MOSHI_BNB4), **kwargs))
 
 
+def _pt_valid(pt_path) -> bool:
+    """A complete torch.save file is a zip with a central directory; a
+    truncated/concurrently-written one is not (cheap check — reads the file
+    tail only)."""
+    import zipfile
+    try:
+        p = Path(pt_path)
+        return p.stat().st_size > 0 and zipfile.is_zipfile(p)
+    except Exception:
+        return False
+
+
+def ensure_pt_checkpoint(weight_path: str) -> str:
+    """One-off safetensors -> .pt conversion, done ONCE (ideally in the parent
+    process before spawning workers). The repo's .pt load path uses
+    torch.load(map_location='cpu') — its safetensors path instead loads the
+    whole ~17GB state dict onto GPU 0 (dev.type == 'cuda'), which OOMs GPU 0
+    when several per-GPU workers load concurrently. Atomic (tmp file +
+    os.replace) so concurrent converters can never leave a corrupt file, and
+    an existing corrupt (truncated) .pt is reconverted."""
+    weight_path = str(weight_path)
+    pt_path = weight_path + ".pt"
+    if Path(pt_path).exists() and _pt_valid(pt_path):
+        return pt_path
+    from safetensors.torch import load_file
+    tmp_path = f"{pt_path}.tmp{os.getpid()}"
+    print(f"[eh_common] converting safetensors -> {pt_path} (one-off, ~17GB)")
+    torch.save(load_file(weight_path), tmp_path)
+    os.replace(tmp_path, pt_path)          # atomic on POSIX and Windows
+    return pt_path
+
+
 def load_lm_bf16(weight_path, device="cuda", dtype=torch.bfloat16):
-    """Merged emotionplex-7b (bf16 safetensors). Falls back to a one-off .pt
-    conversion if this moshi build cannot read safetensors directly."""
+    """Merged emotionplex-7b (bf16). Prefers the pre-converted .pt (CPU
+    map_location — no GPU-0 spike); direct safetensors load otherwise, with an
+    atomic .pt conversion fallback."""
     from moshi.models import loaders
     weight_path = str(weight_path)
+    pt_path = weight_path + ".pt" if weight_path.endswith(".safetensors") else None
     kwargs = _filtered_kwargs(loaders.get_moshi_lm, dict(device=device, dtype=dtype))
+    if pt_path and Path(pt_path).exists() and _pt_valid(pt_path):
+        return _freeze(loaders.get_moshi_lm(pt_path, **kwargs))
     try:
         return _freeze(loaders.get_moshi_lm(weight_path, **kwargs))
     except Exception:
-        if not weight_path.endswith(".safetensors"):
+        if not pt_path:
             raise
-        from safetensors.torch import load_file
-        pt_path = weight_path + ".pt"
-        if not Path(pt_path).exists():
-            print(f"[eh_common] converting safetensors -> {pt_path} (one-off, ~17GB)")
-            torch.save(load_file(weight_path), pt_path)
-        return _freeze(loaders.get_moshi_lm(pt_path, **kwargs))
+        return _freeze(loaders.get_moshi_lm(ensure_pt_checkpoint(weight_path), **kwargs))
 
 
 def make_lm_gen(lm, device="cuda", cfg_coef=1.0):
@@ -427,6 +458,9 @@ def make_lm_gen(lm, device="cuda", cfg_coef=1.0):
         lm_gen = LMGen(lm, cfg_coef=float(cfg_coef), condition_tensors=cond)
     except TypeError:
         lm_gen = LMGen(lm, device=device)
+    # audio_silence_frame_cnt stays at the LMGen default: extraction and
+    # generation must use the exact prompt prefix liveTry.py uses
+    # (LMGen(lm, device=device) with no overrides).
     lm_gen.streaming_forever(1)
     return lm_gen
 
@@ -654,16 +688,26 @@ def build_agent_text_stream(alignments, n_frames: int, sp, fps: float = FRAME_HZ
 # ---------------------------------------------------------------------------
 # Teacher-forced feature extraction (Phase A: dataset clips; Phase B: generated)
 # ---------------------------------------------------------------------------
+def _stream8(codes):
+    """Keep the first 8 codebooks of a [T, K] code tensor. PersonaPlex's LM
+    step returns 17 streams (1 text + 8 agent + 8 user echo); legacy gen
+    shards saved all 16 audio streams — the agent stream is the first 8."""
+    return codes[:, :N_AUDIO_CODEBOOKS] if int(codes.shape[1]) > N_AUDIO_CODEBOOKS else codes
+
+
 @torch.no_grad()
 def extract_from_codes(lm_gen, mimi, user_codes, agent_codes, text_tokens=None,
                        device="cuda") -> dict:
     """Teacher-force one conversation through the live-identical step path.
 
-    user_codes/agent_codes: int64 [T, 8]. text_tokens: int64 [T] (default: all PAD).
+    user_codes/agent_codes: int64 [T, 8] (16-wide legacy gen codes are sliced
+    to the agent stream). text_tokens: int64 [T] (default: all PAD).
     Returns hidden [T,4096] fp16 (final-layer transformer_out, post out_norm,
     the SAME tensor the live server captures), agent_codes int16, mimi_lat
     [T,512] fp16.
     """
+    user_codes = _stream8(user_codes)
+    agent_codes = _stream8(agent_codes)
     T = max(int(user_codes.shape[0]), int(agent_codes.shape[0]))
     sil = mimi_encode_codes(mimi, np.zeros(FRAME_SAMPLES, np.float32), device)[0]  # [8]
 
@@ -785,10 +829,10 @@ def generate_reply(lm_gen, mimi, user_pcm, *, max_reply_s=20.0, min_reply_s=0.5,
             out = _step_force(
                 lm_gen,
                 input_tokens=all_codes[t].view(1, N_AUDIO_CODEBOOKS, 1).to(device))
-            tokens = out[0]                              # [1, 9, 1]
+            tokens = out[0]                              # [1, 17, 1]: text | agent 8 | user echo 8
             text_tokens.append(int(tokens[0, 0, 0].item()))
-            codes.append(tokens[0, 1:, 0].long().cpu())
-            frame = mimi.decode(tokens[:, 1:])
+            codes.append(tokens[0, 1:1 + N_AUDIO_CODEBOOKS, 0].long().cpu())   # agent stream only
+            frame = mimi.decode(tokens[:, 1:1 + N_AUDIO_CODEBOOKS])
             pcm_f = frame[0, 0].float().cpu().numpy()
             pcm_chunks.append(pcm_f)
             r = float(np.sqrt(np.mean(pcm_f * pcm_f)))
@@ -806,14 +850,83 @@ def generate_reply(lm_gen, mimi, user_pcm, *, max_reply_s=20.0, min_reply_s=0.5,
         T_out -= 1
     codes = torch.stack(codes)[:T_out]
     pcm = np.concatenate(pcm_chunks)[: T_out * FRAME_SAMPLES] if pcm_chunks else np.zeros(0, np.float32)
+    rms_arr = np.asarray(rms, dtype=np.float32)
+    txt_arr = np.asarray(text_tokens, dtype=np.int64)
+    spk = np.nonzero(rms_arr > rms_threshold)[0]
+    dbg = {                                   # full-timeline QA diagnostics
+        "t_max": int(T_max), "n_uf": int(len(urms)), "user_end": int(user_end),
+        "spk_total": int(spk.size),
+        "spk_first": int(spk[0]) if spk.size else -1,
+        "spk_last": int(spk[-1]) if spk.size else -1,
+        "max_rms": float(rms_arr.max()) if rms_arr.size else 0.0,
+        "words": int((txt_arr > TEXT_PAD).sum()),
+        "epad": int((txt_arr == TEXT_EOP).sum()),
+        "pad": int((txt_arr == TEXT_PAD).sum()),
+    }
     return {
         "codes": codes.to(torch.int16),
-        "text_tokens": np.asarray(text_tokens[:T_out], dtype=np.int64),
+        "text_tokens": txt_arr[:T_out],
         "pcm": pcm.astype(np.float32),
-        "rms": np.asarray(rms[:T_out], dtype=np.float32),
+        "rms": rms_arr[:T_out],
         "n_user_frames": user_end,
         "user_codes": all_codes[:T_out].to(torch.int16),
+        "dbg": dbg,
     }
+
+
+def _decode_words(sp, text_tokens, max_chars=60):
+    """sentencepiece-decode the word pieces (ids > TEXT_PAD) of a generated
+    text stream — QA diagnostics only ('' when the model said nothing)."""
+    if sp is None:
+        return ""
+    try:
+        ids = [int(t) for t in text_tokens if int(t) > TEXT_PAD]
+        return sp.decode(ids)[:max_chars] if ids else ""
+    except Exception:
+        return ""
+
+
+@torch.no_grad()
+def qa_generate_reply(lm_gen, mimi, sp, user_pcm, prompt_state, *,
+                      max_reply_s=18.0, min_reply_s=0.5, stop_silence_s=2.0,
+                      max_attempts=3, device="cuda", log=None, tag=""):
+    """generate_reply + QA + stochastic retries. Sampling is unseeded, so each
+    attempt is an independent draw — when the first draw lands in silence a
+    fresh one usually speaks. Returns (out, reject_reason); reason is None when
+    QA passed. Every rejected attempt is logged with full-timeline diagnostics
+    (speech frames ANYWHERE, first/last speech frame, max rms, text-stream
+    histogram, decoded words) so 'model truly silent' (spk=0, words=0) is
+    distinguishable from 'replied inside the clip but VAD misplaced user_end'
+    (spk_first < uend) directly from the log."""
+    min_frames = max(1, int(min_reply_s * FRAME_HZ))
+    attempts = max(1, int(max_attempts))
+    out, reason = None, "too_short"
+    for attempt in range(1, attempts + 1):
+        restore_streaming_state(lm_gen, mimi, prompt_state)
+        out = generate_reply(lm_gen, mimi, user_pcm, max_reply_s=max_reply_s,
+                             min_reply_s=min_reply_s, stop_silence_s=stop_silence_s,
+                             device=device)
+        T = int(out["codes"].shape[0])
+        ue = int(out["n_user_frames"])
+        reply_frames = T - ue
+        speak_frames = int((out["rms"][ue:] > 0.006).sum())
+        speak = float((out["rms"][ue:] > 0.006).mean()) if reply_frames > 0 else 0.0
+        if reply_frames < min_frames:
+            reason = "too_short"
+        elif not (0.05 <= speak <= 0.97):
+            reason = "speak_fraction"
+        else:
+            return out, None
+        if log is not None:
+            d = out["dbg"]
+            log.log(f"{tag}QA {reason} (attempt {attempt}/{attempts}): "
+                    f"reply={reply_frames}f speak={speak_frames}f uend={ue} T={T} | "
+                    f"tmax={d['t_max']} nuf={d['n_uf']} spk={d['spk_total']}f "
+                    f"first={d['spk_first']} last={d['spk_last']} "
+                    f"maxrms={d['max_rms']:.4f} words={d['words']} "
+                    f"epad={d['epad']} pad={d['pad']} "
+                    f"txt='{_decode_words(sp, out['text_tokens'])}'")
+    return out, reason
 
 
 # ---------------------------------------------------------------------------
@@ -1012,6 +1125,27 @@ def completed_clip_ids(feat_dir, prefix) -> set:
     return done
 
 
+def scan_frozen_shards(feat_dir, prefix, key="hidden", std_eps=1e-4) -> dict:
+    """Detect shards whose per-frame features are frozen over time — the
+    signature of the multi-GPU wrong-device CUDA-graph bug (workers on
+    cuda:1..N replayed empty graphs, emitting the SAME hidden vector at every
+    frame of every clip). A record counts as frozen when its `key` tensor has
+    ~zero variation across frames. Returns {shard_name: (n_records,
+    n_frozen)}. Shards with n_frozen > 0 must be deleted and re-extracted
+    (extraction is resume-safe: re-running only re-does the missing clips)."""
+    report = {}
+    for path in sorted(Path(feat_dir).glob(f"{prefix}*_shard_*.pt")):
+        n = frozen = 0
+        for rec in torch.load(path, map_location="cpu", weights_only=False):
+            h = rec.get(key)
+            n += 1
+            if isinstance(h, torch.Tensor) and h.ndim >= 2 and \
+                    float(h.float().std(dim=0).mean()) < std_eps:
+                frozen += 1
+        report[path.name] = (n, frozen)
+    return report
+
+
 def read_channel(path, channel: int, sr: int = SAMPLE_RATE) -> np.ndarray:
     import soundfile as sf
     data, file_sr = sf.read(str(path), dtype="float32", always_2d=True)
@@ -1146,8 +1280,84 @@ def train_head(model, train_loader, val_loader, *, device="cuda", epochs=12,
 # its own shard prefix (e.g. phaseA_g2) + log file, so resume is per-worker and
 # iter_shard_records picks every worker's shards up transparently.
 # ---------------------------------------------------------------------------
+def _bind_worker_device(gpu_id) -> None:
+    """MUST be the first CUDA-touching statement of every spawned GPU worker.
+    moshi's CUDAGraphed (compile.py) captures on torch's *current* device's
+    stream; a worker that keeps the inherited current device (cuda:0) while
+    its tensors live on cuda:<gpu_id> captures EMPTY graphs whose replay()
+    returns frozen, input-independent outputs — the multi-GPU silent-output
+    bug where every sample on a GPU yields the same maxrms and 0 words.
+    No-op when CUDA is unavailable (CPU smoke harness)."""
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.set_device(int(gpu_id))
+    assert torch.cuda.current_device() == int(gpu_id), \
+        f"failed to bind worker to cuda:{gpu_id}"
+
+
+@torch.no_grad()
+def assert_graphs_live(lm_gen, mimi, prompt_state, device="cuda") -> float:
+    """Fail-fast proof that moshi's CUDA-graphed callables actually recompute
+    on THIS device (see _bind_worker_device for the bug this guards against).
+
+    LM probe: two trials from the same restored prompt state, each stepping
+    TWICE — a trial frame, then a shared frame — and comparing the second
+    step's hidden. A single step cannot work: prepare_step_input feeds the
+    transformer from cache position offset-1 while input_tokens are written
+    at offset+delay (lm.py L744-800), so a user frame only influences
+    transformer_out one step later. Mimi probe: a 4-frame decode in a single
+    streaming context, so the graphed decoder reaches replay(). Raises
+    RuntimeError if either output stops depending on its input. Restores the
+    prompt state before returning the LM hidden cosine (for logging)."""
+    t = np.arange(FRAME_SAMPLES, dtype=np.float32) / SAMPLE_RATE
+    signals = (np.zeros(FRAME_SAMPLES, np.float32),
+               0.2 * np.sin(2 * np.pi * 440 * t),
+               0.2 * np.sin(2 * np.pi * 880 * t))
+    codes = [mimi_encode_codes(mimi, s, device)[0] for s in signals]
+    assert not (torch.equal(codes[0], codes[1])
+                or torch.equal(codes[1], codes[2])), \
+        "mimi encoder returned identical codes for silence and sines"
+    # trial frames: only the delay-0 user codebook (q=0, lm.py delays[9]=0)
+    # reaches transformer_out by the compared (second) step, so guarantee the
+    # two trials differ there by construction (mimi codebook card = 2048).
+    trial_a = codes[0]
+    trial_b = codes[0].clone()
+    trial_b[0] = (trial_b[0] + 1) % 2048
+    shared = codes[0].view(1, N_AUDIO_CODEBOOKS, 1).to(device)
+    hid = []
+    for frame in (trial_a, trial_b):
+        restore_streaming_state(lm_gen, mimi, prompt_state)
+        _step_force(lm_gen,
+                    input_tokens=frame.view(1, N_AUDIO_CODEBOOKS, 1).to(device))
+        out = _step_force(lm_gen, input_tokens=shared)
+        hid.append(out[2][0, -1].float().reshape(-1).cpu())
+    cos = float(torch.nn.functional.cosine_similarity(hid[0], hid[1], dim=0))
+    pcm = []
+    with mimi.streaming(1):
+        for frame in codes + codes[:1]:   # 4 decodes -> graphed decoder replays
+            pcm.append(mimi.decode(
+                frame.view(1, N_AUDIO_CODEBOOKS, 1).to(device))[0, 0].float().cpu())
+    restore_streaming_state(lm_gen, mimi, prompt_state)
+    # frozen decoder graph: capture runs eagerly, replays return the
+    # capture-time output verbatim -> three identical PCMs in a row.
+    mimi_frozen = bool(torch.equal(pcm[1], pcm[2]) and torch.equal(pcm[2], pcm[3]))
+    if cos > 0.99999 or mimi_frozen:
+        raise RuntimeError(
+            f"CUDA graphs on {device} replay FROZEN outputs (lm cos={cos:.6f} "
+            f"mimi_frozen={mimi_frozen}): this worker is not running on its "
+            f"assigned GPU (torch.cuda.set_device must run before moshi's "
+            f"CUDAGraphed captures). Refusing to produce input-independent "
+            f"garbage.")
+    return cos
+
+
 def _load_stack_on(root, device, bf16_model_st=None):
     """Load sp + mimi + LM + LMGen(hidden step) on `device` inside a worker."""
+    if str(device).startswith("cuda:"):
+        # second safeguard (see _bind_worker_device): moshi's CUDAGraphed
+        # captures on the current device's stream, so the current device MUST
+        # be the target GPU before any allocation/graph warmup happens here.
+        torch.cuda.set_device(int(str(device).split(":")[1]))
     P = get_paths(root)
     ensure_moshi_importable(P)
     sp = load_sp(P)
@@ -1170,6 +1380,7 @@ def _prompt_state_for(lm_gen, mimi, sp, P, use_prompt: bool):
 
 
 def _phaseA_worker(gpu_id, n_gpus, root, jobs, cfg):
+    _bind_worker_device(gpu_id)   # MUST be first: see assert_graphs_live
     device = f"cuda:{gpu_id}"
     P, sp, mimi, lm_gen = _load_stack_on(root, device)
     prompt_state = _prompt_state_for(lm_gen, mimi, sp, P, cfg.get("use_prompt", True))
@@ -1181,6 +1392,8 @@ def _phaseA_worker(gpu_id, n_gpus, root, jobs, cfg):
     log.log(f"=== gpu{gpu_id} phaseA START | completed={total - len(todo)} "
             f"todo={len(todo)} | device={device} use_prompt={cfg.get('use_prompt', True)}",
             force=True)
+    cos = assert_graphs_live(lm_gen, mimi, prompt_state, device)
+    log.log(f"[gpu{gpu_id}] graphs live OK (lm cos={cos:.4f})", force=True)
     t0 = time.time()
     failed, times = 0, []
     for row in todo:
@@ -1235,6 +1448,7 @@ def phaseA_extract_multi(jobs, root, n_gpus, cfg):
 
 
 def _gen_worker(gpu_id, n_gpus, root, samples, cfg):
+    _bind_worker_device(gpu_id)   # MUST be first: see assert_graphs_live
     device = f"cuda:{gpu_id}"
     P, sp, mimi, lm_gen = _load_stack_on(root, device, bf16_model_st=cfg["model_st"])
     base_state = snapshot_streaming_state(lm_gen)
@@ -1249,37 +1463,27 @@ def _gen_worker(gpu_id, n_gpus, root, samples, cfg):
     todo = [s for s in samples[gpu_id::n_gpus] if s["sample_id"] not in done_all]
     total = len(done_all & {s["sample_id"] for s in samples[gpu_id::n_gpus]}) + len(todo)
     log.log(f"=== gpu{gpu_id} generation START | completed={total - len(todo)} "
-            f"todo={len(todo)} | device={device}", force=True)
+            f"todo={len(todo)} | device={device} "
+            f"| max_attempts={int(cfg.get('max_attempts', 3))}", force=True)
+    cos = assert_graphs_live(lm_gen, mimi, prompt_states[EMOTIONS[0]], device)
+    log.log(f"[gpu{gpu_id}] graphs live OK (lm cos={cos:.4f})", force=True)
     t0 = time.time()
     failed, times = 0, []
     qa_fail = {"too_short": 0, "speak_fraction": 0}
-    min_frames = int(cfg.get("min_reply_s", 0.5) * FRAME_HZ)
     for s in todo:
         ct0 = time.time()
         try:
             user = read_channel(s["wav_path"], 1)      # right channel = user
-            restore_streaming_state(lm_gen, mimi, prompt_states[s["emotion"]])
-            out = generate_reply(lm_gen, mimi, user,
-                                 max_reply_s=cfg.get("max_reply_s", 18.0),
-                                 min_reply_s=cfg.get("min_reply_s", 0.5),
-                                 stop_silence_s=cfg.get("stop_silence_s", 2.0),
-                                 device=device)
-            T = out["codes"].shape[0]
-            reply_frames = T - out["n_user_frames"]
-            speak_frames = int((out["rms"][out["n_user_frames"]:] > 0.006).sum())
-            speak = (float((out["rms"][out["n_user_frames"]:] > 0.006).mean())
-                     if reply_frames > 0 else 0.0)
-            if reply_frames < min_frames:
-                qa_fail["too_short"] += 1
-                log.log(f"[gpu{gpu_id}] QA too_short {s['sample_id']} ({s['emotion']}): "
-                        f"reply={reply_frames}f speak={speak_frames}f "
-                        f"uend={out['n_user_frames']} T={T}")
-                continue
-            if not (0.05 <= speak <= 0.97):
-                qa_fail["speak_fraction"] += 1
-                log.log(f"[gpu{gpu_id}] QA speak_fraction {s['sample_id']} ({s['emotion']}): "
-                        f"speak={speak:.2f} reply={reply_frames}f "
-                        f"uend={out['n_user_frames']} T={T}")
+            out, reason = qa_generate_reply(
+                lm_gen, mimi, sp, user, prompt_states[s["emotion"]],
+                max_reply_s=cfg.get("max_reply_s", 18.0),
+                min_reply_s=cfg.get("min_reply_s", 0.5),
+                stop_silence_s=cfg.get("stop_silence_s", 2.0),
+                max_attempts=cfg.get("max_attempts", 3),
+                device=device, log=log,
+                tag=f"[gpu{gpu_id}] {s['sample_id']} ({s['emotion']}) ")
+            if reason is not None:
+                qa_fail[reason] += 1
                 continue
             writer.add(dict(
                 clip_id=s["sample_id"], src_clip=s["clip_id"], user_id=s["user_id"],
@@ -1311,14 +1515,21 @@ def _gen_worker(gpu_id, n_gpus, root, samples, cfg):
 def generate_multi(samples, root, n_gpus, cfg):
     """Spawn one in-domain generation worker per GPU (emotionplex-7b bf16 on
     each). cfg: model_st, max_reply_s, min_reply_s, stop_silence_s,
-    clips_per_shard. Blocks until all workers finish. Workers are capped at
-    the sample count so a tiny (smoke) list never spawns idle workers."""
+    max_attempts, clips_per_shard. Blocks until all workers finish. Workers
+    are capped at the sample count so a tiny (smoke) list never spawns idle
+    workers."""
     import torch.multiprocessing as tmp
     n_gpus = max(1, min(int(n_gpus), max(1, len(samples))))
+    if n_gpus > 1 and str(cfg.get("model_st", "")).endswith(".safetensors"):
+        # convert safetensors -> .pt ONCE here in the parent: the repo's
+        # safetensors load puts the whole state dict on GPU 0 (OOM when N
+        # workers load at once) and concurrent conversions corrupt the file.
+        ensure_pt_checkpoint(cfg["model_st"])
     tmp.spawn(_gen_worker, args=(n_gpus, root, samples, cfg), nprocs=n_gpus, join=True)
 
 
 def _phaseB_worker(gpu_id, n_gpus, root, cfg):
+    _bind_worker_device(gpu_id)   # MUST be first: see assert_graphs_live
     device = f"cuda:{gpu_id}"
     P, sp, mimi, lm_gen = _load_stack_on(root, device)
     prompt_state = _prompt_state_for(lm_gen, mimi, sp, P, True)
@@ -1336,6 +1547,8 @@ def _phaseB_worker(gpu_id, n_gpus, root, cfg):
     total = len(done_all & {r["clip_id"] for r in gen_recs[gpu_id::n_gpus]}) + len(todo)
     log.log(f"=== gpu{gpu_id} phaseB START | completed={total - len(todo)} "
             f"todo={len(todo)} | device={device}", force=True)
+    cos = assert_graphs_live(lm_gen, mimi, prompt_state, device)
+    log.log(f"[gpu{gpu_id}] graphs live OK (lm cos={cos:.4f})", force=True)
     t0 = time.time()
     failed, times = 0, []
     for r in todo:

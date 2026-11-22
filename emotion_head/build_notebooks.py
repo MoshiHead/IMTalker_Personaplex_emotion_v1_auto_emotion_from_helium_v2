@@ -740,6 +740,13 @@ else:
             f"failed={failed} | elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
     print("done. total completed:", len(writer.completed), "| failed:", failed,
           "| log:", log.path)
+# post-extraction integrity scan: hidden features frozen over time = a worker
+# ran CUDA graphs on the wrong device (fixed via _bind_worker_device). Bad
+# shards must be deleted and re-extracted by re-running this cell (resume-safe).
+_scan = eh.scan_frozen_shards(P.FEAT_A, "phaseA")
+_bad = {k: v for k, v in _scan.items() if v[1]}
+print("frozen-feature scan:", "OK" if not _bad else
+      f"CORRUPT -> {_bad} — delete these shards and re-run this cell")
 ''', tags=("gpu",)),
 code(r'''
 import collections
@@ -804,6 +811,10 @@ if P.SMOKE:
     print("SMOKE: gates are informational only — tiny data is not representative")
 '''),
 code(r'''
+_frozen = eh.scan_frozen_shards(P.FEAT_A, "phaseA")
+_bad = {k: v for k, v in _frozen.items() if v[1]}
+assert not _bad, (f"frozen hidden features (wrong-device CUDA graphs) in {_bad} — "
+                  "delete those shards, re-run 02 (resume-safe), then re-train here")
 recs = list(eh.iter_shard_records(P.FEAT_A, "phaseA"))
 print("clips:", len(recs), "| splits:", collections.Counter(r["split"] for r in recs))
 by_split = {}
@@ -1036,7 +1047,20 @@ trained on Mimi/VARM3-domain audio (the dataset's Higgs voices are off-domain).
   content (RMS VAD on the user channel), and the post-clip input is looped roomtone
   from the clip's own background — never digital zeros (out-of-distribution).
 - Stop rule: model fell silent for `STOP_SILENCE_S` after having spoken; hard cap
-  `MAX_REPLY_S`. QA rejects too-short / silent / over-talkative outputs.
+  `MAX_REPLY_S`. QA rejects too-short / silent / over-talkative outputs, with up to
+  `MAX_ATTEMPTS` stochastic retries per sample (sampling is unseeded, so a fresh
+  draw is independent). Every rejected attempt logs full-timeline diagnostics
+  (speech frames anywhere, first/last, max rms, text-stream histogram, decoded
+  words) so 'model truly silent' (`spk=0 words=0`) is distinguishable from
+  'replied in-clip but VAD misplaced user_end' (`first < uend`).
+- **Multi-GPU correctness** (the bug that made every non-neutral GPU 100% silent):
+  moshi's `CUDAGraphed` captures on torch's *current* device's stream, so each
+  spawned worker first binds its own GPU (`_bind_worker_device`) and then proves
+  its graphs recompute (`assert_graphs_live`) before generating. A worker whose
+  graphs replay frozen, input-independent outputs (constant per-GPU maxrms,
+  0 words) now fails loudly at startup instead of silently writing garbage
+  shards. The preview cell also asserts no shard contains identical audio
+  across samples (the frozen-graph signature).
 - ~3–6 s per sample on a 5090 → 4k samples ≈ 4–7 h. Resume-safe.
 
 **Restart the kernel before this notebook** if you ran 02/03 in this session
@@ -1049,6 +1073,7 @@ N_SAMPLES = RUN.nb04_n_samples          # full 4000 | smoke 12
 MAX_REPLY_S = RUN.nb04_max_reply_s      # full 18.0 | smoke 8.0
 STOP_SILENCE_S = RUN.nb04_stop_silence_s  # full 2.0 | smoke 1.0
 MIN_REPLY_S = RUN.nb04_min_reply_s
+MAX_ATTEMPTS = RUN.nb04_max_attempts    # stochastic retries per sample (full 2 | smoke 2)
 GEN_CLIPS_PER_SHARD = RUN.nb04_gen_clips_per_shard   # full 128 | smoke 4
 '''),
 code(r'''
@@ -1107,7 +1132,7 @@ if N_GPUS > 1:
     eh.generate_multi(samples, str(P.ROOT), N_GPUS,
                       dict(model_st=str(GEN_DIR / "model.safetensors"),
                            max_reply_s=MAX_REPLY_S, min_reply_s=MIN_REPLY_S,
-                           stop_silence_s=STOP_SILENCE_S,
+                           stop_silence_s=STOP_SILENCE_S, max_attempts=MAX_ATTEMPTS,
                            clips_per_shard=GEN_CLIPS_PER_SHARD))
     print("all workers done | shards:", len(list(P.GEN.glob("gen*_shard_*.pt"))),
           "| logs:", sorted(p.name for p in P.GEN.glob("generate*.log")))
@@ -1118,34 +1143,22 @@ else:
     todo = [s for s in samples if s["sample_id"] not in writer.completed]
     total_target = len(writer.completed) + len(todo)
     log.log(f"=== generation START | completed={len(writer.completed)} todo={len(todo)} "
-            f"target={total_target} | max_reply={MAX_REPLY_S}s stop_silence={STOP_SILENCE_S}s",
-            force=True)
+            f"target={total_target} | max_reply={MAX_REPLY_S}s stop_silence={STOP_SILENCE_S}s "
+            f"| max_attempts={MAX_ATTEMPTS}", force=True)
     t0 = time.time()
     failed, times = 0, []
-    min_frames = int(MIN_REPLY_S * eh.FRAME_HZ)
     for s in tqdm(todo, total=len(todo)):
         ct0 = time.time()
         try:
             user = eh.read_channel(s["wav_path"], 1)   # right channel = user
-            eh.restore_streaming_state(lm_gen, mimi, prompt_states[s["emotion"]])
-            out = eh.generate_reply(lm_gen, mimi, user, max_reply_s=MAX_REPLY_S,
-                                    min_reply_s=MIN_REPLY_S, stop_silence_s=STOP_SILENCE_S,
-                                    device=DEVICE)
-            T = out["codes"].shape[0]
-            reply_frames = T - out["n_user_frames"]
-            speak_frames = int((out["rms"][out["n_user_frames"]:] > 0.006).sum())
-            speak = float((out["rms"][out["n_user_frames"]:] > 0.006).mean()) if reply_frames > 0 else 0.0
-            if reply_frames < min_frames:
-                qa_fail["too_short"] += 1
-                log.log(f"QA too_short {s['sample_id']} ({s['emotion']}): "
-                        f"reply={reply_frames}f speak={speak_frames}f "
-                        f"uend={out['n_user_frames']} T={T}")
-                continue
-            if not (0.05 <= speak <= 0.97):
-                qa_fail["speak_fraction"] += 1
-                log.log(f"QA speak_fraction {s['sample_id']} ({s['emotion']}): "
-                        f"speak={speak:.2f} reply={reply_frames}f "
-                        f"uend={out['n_user_frames']} T={T}")
+            out, reason = eh.qa_generate_reply(
+                lm_gen, mimi, sp, user, prompt_states[s["emotion"]],
+                max_reply_s=MAX_REPLY_S, min_reply_s=MIN_REPLY_S,
+                stop_silence_s=STOP_SILENCE_S, max_attempts=MAX_ATTEMPTS,
+                device=DEVICE, log=log,
+                tag=f"{s['sample_id']} ({s['emotion']}) ")
+            if reason is not None:
+                qa_fail[reason] += 1
                 continue
             rec = dict(clip_id=s["sample_id"], src_clip=s["clip_id"], user_id=s["user_id"],
                        emotion=s["emotion"], label=eh.EMO2ID[s["emotion"]],
@@ -1177,6 +1190,17 @@ else:
           "| failed:", failed, "| log:", log.path)
 ''', tags=("gpu",)),
 code(r'''
+# shard integrity: wrong-device CUDA graphs make every sample on a GPU return
+# the same audio -> identical pcm across a whole shard means that shard is
+# corrupt (legacy shards from before _bind_worker_device).
+_bad = {}
+for _p in sorted(P.GEN.glob("gen*_shard_*.pt")):
+    _pcms = [r["pcm"] for r in torch.load(_p, map_location="cpu", weights_only=False)]
+    if len(_pcms) > 1 and all(torch.equal(_pcms[0], x) for x in _pcms[1:]):
+        _bad[_p.name] = len(_pcms)
+assert not _bad, (f"identical pcm across shard (wrong-device CUDA graphs): {_bad} "
+                  "— delete these shards and re-run generation (resume-safe)")
+print("gen shard integrity OK")
 from IPython.display import Audio, display
 if not previews:    # multi-GPU run (or resumed kernel): pull previews from shards
     for rec in eh.iter_shard_records(P.GEN, "gen"):
@@ -1320,6 +1344,10 @@ else:
     log.log(f"=== phaseB extraction END | completed={len(writer.completed)}/{total_target} "
             f"failed={failed} | elapsed={(time.time() - t0) / 3600:.2f}h", force=True)
     print("phaseB extracted:", len(writer.completed), "| failed:", failed, "| log:", log.path)
+_scan = eh.scan_frozen_shards(P.FEAT_B, "phaseB")
+_bad = {k: v for k, v in _scan.items() if v[1]}
+print("frozen-feature scan:", "OK" if not _bad else
+      f"CORRUPT -> {_bad} — delete these shards and re-run this cell (resume-safe)")
 for _n in ("lm", "lm_gen", "mimi"):
     globals().pop(_n, None)
 eh.free_gpu()

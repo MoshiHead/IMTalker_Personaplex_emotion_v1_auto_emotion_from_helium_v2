@@ -88,12 +88,14 @@ check("full nb02_max_clips=8000", rf.nb02_max_clips == 8000)
 check("full nb03 16/12/3", (rf.nb03_batch_size, rf.nb03_epochs, rf.nb03_patience) == (16, 12, 3))
 check("full nb04 4000/18/2", (rf.nb04_n_samples, rf.nb04_max_reply_s,
                               rf.nb04_stop_silence_s) == (4000, 18.0, 2.0))
+check("full nb04 max_attempts=2", rf.nb04_max_attempts == 2)
 check("full nb05 8/16", (rf.nb05_epochs, rf.nb05_batch_size) == (8, 16))
 check("full nb06 24/1000", (rf.nb06_replay_clips, rf.nb06_latency_iters) == (24, 1000))
 check("full downloads all audio", rf.nb00_download_all_audio is True)
 check("smoke nb03 4/2/2", (rs.nb03_batch_size, rs.nb03_epochs, rs.nb03_patience) == (4, 2, 2))
 check("smoke nb04 12/8/1", (rs.nb04_n_samples, rs.nb04_max_reply_s,
                             rs.nb04_stop_silence_s) == (12, 8.0, 1.0))
+check("smoke nb04 max_attempts=2", rs.nb04_max_attempts == 2)
 check("smoke subset 10+3/emo", (rs.smoke_train_clips_per_emotion,
                                 rs.smoke_val_clips_per_emotion) == (10, 3))
 
@@ -143,6 +145,179 @@ check("roomtone slice is 1s", len(_room) == int(eh.FRAME_HZ) * eh.FRAME_SAMPLES)
 _ue2 = eh._prep_user_turn(_rt(3 * eh.SAMPLE_RATE))[2]
 check("no speech -> end = clip end", _ue2 == int(np.ceil(3 * eh.SAMPLE_RATE / eh.FRAME_SAMPLES)))
 del _rngn, _rt, _sp, _pcm, _up, _ur, _ue, _room, _exp, _ue2
+
+# _stream8: legacy 16-wide gen codes (agent 8 + user echo 8) -> agent stream
+_c16 = torch.arange(16).view(1, 16).expand(5, 16)
+check("_stream8 slices legacy 16-wide codes", eh._stream8(_c16).shape == (5, 8))
+check("_stream8 keeps agent stream first", int(eh._stream8(_c16)[0, 7]) == 7)
+_c8 = torch.zeros(5, 8, dtype=torch.long)
+check("_stream8 passes 8-wide through", eh._stream8(_c8) is _c8)
+del _c16, _c8
+
+# _pt_valid: complete torch.save zip vs truncated (multi-GPU conversion race)
+_ptf = Path(tempfile.mkdtemp(prefix="eh_ptv_")) / "m.pt"
+torch.save({"a": torch.zeros(3)}, _ptf)
+check("_pt_valid accepts a complete checkpoint", eh._pt_valid(_ptf))
+_b = _ptf.read_bytes()
+_ptf.write_bytes(_b[: len(_b) // 2])          # truncated -> no central directory
+check("_pt_valid rejects a truncated checkpoint", not eh._pt_valid(_ptf))
+check("_pt_valid rejects a missing file", not eh._pt_valid(_ptf.with_name("nope.pt")))
+del _ptf, _b
+
+# ---------------------------------------------------------------------------
+# 2d. qa_generate_reply: QA + stochastic retry logic (generate_reply mocked)
+# ---------------------------------------------------------------------------
+print("\n== qa_generate_reply (mocked) ==")
+class _FakeSP:
+    def decode(self, ids):
+        return " ".join(f"w{i}" for i in ids)
+check("_decode_words filters pad/epad", eh._decode_words(_FakeSP(), [3, 0, 5, 6, 3]) == "w5 w6")
+check("_decode_words None sp -> ''", eh._decode_words(None, [5]) == "")
+check("_decode_words all pad -> ''", eh._decode_words(_FakeSP(), [3, 0, 3]) == "")
+
+
+def _fake_out(T, ue, rms_val, lo=0, hi=0):
+    rms = np.zeros(T, np.float32)
+    rms[lo:hi] = rms_val
+    return {"codes": torch.zeros(T, 8, dtype=torch.int16),
+            "text_tokens": np.full(T, eh.TEXT_PAD, dtype=np.int64),
+            "pcm": np.zeros(T * eh.FRAME_SAMPLES, np.float32),
+            "rms": rms, "n_user_frames": ue,
+            "user_codes": torch.zeros(T, 8, dtype=torch.int16),
+            "dbg": dict(t_max=T, n_uf=ue, user_end=ue,
+                        spk_total=int((rms > 0.006).sum()),
+                        spk_first=int(lo) if rms_val > 0.006 else -1,
+                        spk_last=int(hi - 1) if rms_val > 0.006 else -1,
+                        max_rms=float(rms.max()), words=0, epad=0, pad=T)}
+
+
+_calls = {"n": 0}
+def _fake_gen(*a, **kw):
+    _calls["n"] += 1
+    if _calls["n"] < 2:
+        return _fake_out(11, 10, 0.0)                 # silent -> too_short
+    return _fake_out(40, 10, 0.05, lo=12, hi=30)      # speaks -> QA pass
+
+_orig_gen, _orig_restore = eh.generate_reply, eh.restore_streaming_state
+eh.generate_reply, eh.restore_streaming_state = _fake_gen, lambda *a, **k: None
+try:
+    _out, _reason = eh.qa_generate_reply(None, None, _FakeSP(),
+                                         np.zeros(1920, np.float32), {}, max_attempts=3)
+    check("qa retry passes on 2nd attempt", _reason is None and _calls["n"] == 2)
+    def _counting(fn):
+        def _w(*a, **kw):
+            _calls["n"] += 1
+            return fn(*a, **kw)
+        return _w
+    _calls["n"] = 0
+    eh.generate_reply = _counting(lambda *a, **kw: _fake_out(11, 10, 0.0))   # always silent
+    _out, _reason = eh.qa_generate_reply(None, None, None,
+                                         np.zeros(1920, np.float32), {}, max_attempts=3)
+    check("qa gives up after max_attempts (too_short)",
+          _reason == "too_short" and _calls["n"] == 3)
+    _calls["n"] = 0
+    eh.generate_reply = _counting(lambda *a, **kw: _fake_out(40, 10, 0.0))   # long but silent
+    _out, _reason = eh.qa_generate_reply(None, None, None,
+                                         np.zeros(1920, np.float32), {}, max_attempts=2)
+    check("qa speak_fraction reject", _reason == "speak_fraction" and _calls["n"] == 2)
+finally:
+    eh.generate_reply, eh.restore_streaming_state = _orig_gen, _orig_restore
+del _calls, _fake_gen, _fake_out, _FakeSP, _orig_gen, _orig_restore, _out, _reason
+
+# ---------------------------------------------------------------------------
+# 2e. multi-GPU device binding + graph liveness + frozen-shard scan
+# ---------------------------------------------------------------------------
+print("\n== 2e. device binding / graph liveness / frozen-shard scan ==")
+import inspect as _inspect
+for _fn in (eh._phaseA_worker, eh._gen_worker, eh._phaseB_worker):
+    _body = [l for l in _inspect.getsource(_fn).splitlines()[1:] if l.strip()]
+    check(f"{_fn.__name__} binds its CUDA device first",
+          _body[0].strip().startswith("_bind_worker_device(gpu_id)"))
+eh._bind_worker_device(0)   # no CUDA here -> must be a safe no-op
+check("_bind_worker_device is a safe no-op without CUDA", True)
+
+import contextlib as _cl
+
+
+class _MockMimi:
+    """decode: eager for calls 1-2; when frozen=True, calls 3+ replay the
+    call-2 output (mirrors a CUDAGraphed decoder captured on the wrong
+    device, whose replay returns the capture-time output verbatim)."""
+
+    def __init__(self, frozen):
+        self.frozen, self._n, self._cap = frozen, 0, None
+
+    @_cl.contextmanager
+    def streaming(self, n):
+        yield
+
+    def decode(self, codes):
+        self._n += 1
+        if self.frozen and self._n > 2:
+            return self._cap
+        out = torch.full((1, 1, 16), float(codes.sum()))
+        if self._n == 2:
+            self._cap = out
+        return out
+
+
+def _mock_encode_factory():
+    calls = {"n": 0}
+
+    def _enc(mimi, pcm, device):
+        calls["n"] += 1
+        return torch.full((1, eh.N_AUDIO_CODEBOOKS), float(calls["n"]),
+                          dtype=torch.long)
+
+    return _enc
+
+
+def _mk_step(frozen):
+    prev = {"v": 0.0}
+
+    def _step(lm_gen, **kw):
+        h = torch.arange(8, dtype=torch.float32)
+        if not frozen:
+            # lm.py pipeline delay: this step's hidden reflects LAST step's
+            # input; steer one of the LAST-position components (what
+            # assert_graphs_live reads) so trials are clearly separable
+            h[4 + int(prev["v"]) % 4] += 100.0
+        prev["v"] = float(kw["input_tokens"].sum())
+        return None, None, h.view(1, 2, 4)
+    return _step
+
+
+_real_enc = eh.mimi_encode_codes
+_real_sf, _real_rs = eh._step_force, eh.restore_streaming_state
+try:
+    eh.mimi_encode_codes = _mock_encode_factory()
+    eh._step_force = _mk_step(frozen=False)
+    eh.restore_streaming_state = lambda *a, **k: None
+    cos = eh.assert_graphs_live(None, _MockMimi(False), {}, "cpu")
+    check("assert_graphs_live passes on live graphs", 0 < cos < 0.99999)
+    eh._step_force = _mk_step(frozen=True)
+    try:
+        eh.assert_graphs_live(None, _MockMimi(True), {}, "cpu")
+        check("assert_graphs_live raises on frozen graphs", False)
+    except RuntimeError as e:
+        check("assert_graphs_live raises on frozen graphs", "FROZEN" in str(e))
+finally:
+    eh.mimi_encode_codes = _real_enc
+    eh._step_force, eh.restore_streaming_state = _real_sf, _real_rs
+del (_real_enc, _real_sf, _real_rs, _mk_step, _mock_encode_factory, _MockMimi,
+     _cl, _inspect, cos)
+
+_scan_dir = tmp / "scan"
+_scan_dir.mkdir(parents=True, exist_ok=True)
+_w = eh.ShardWriter(_scan_dir, "phaseA", clips_per_shard=10)
+_w.add(dict(clip_id="ok", hidden=torch.randn(50, eh.HELIUM_DIM)))
+_w.add(dict(clip_id="bad", hidden=torch.full((50, eh.HELIUM_DIM), 3.14)))
+_w.close()
+_rep = eh.scan_frozen_shards(_scan_dir, "phaseA")
+check("scan_frozen_shards flags time-frozen hidden features",
+      sum(v[0] for v in _rep.values()) == 2
+      and sum(v[1] for v in _rep.values()) == 1)
+del _scan_dir, _w, _rep
 
 # ---------------------------------------------------------------------------
 # helpers shared by sections 3 and 5
